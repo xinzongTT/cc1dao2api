@@ -1,0 +1,14 @@
+{
+  "name": "commandcode-proxy",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Command Code → OpenAI 兼容代理",
+  "main": "proxy.mjs",
+  "scripts": {
+    "start": "node proxy.mjs",
+    "dev": "node --watch proxy.mjs"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -1,0 +1,1338 @@
+/**
+ * Command Code → OpenAI 兼容代理
+ * 基于真实 CLI 流量抓包数据构建
+ */
+import http from 'http';
+import crypto from 'crypto';
+import { randomUUID } from 'crypto';
+import { readFileSync, existsSync, appendFileSync } from 'fs';
+import { resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
+
+// ── 配置加载 ──────────────────────────────────────
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+function loadConfig() {
+  const defaults = {
+    port: 3000,
+    host: '0.0.0.0',
+    apiKey: '',
+    apiBase: 'https://api.commandcode.ai',
+    projectSlug: 'cc-proxy',
+    logFile: '',
+    logLevel: 'info',
+    useProviderModels: true,
+    modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
+    visionModel: 'moonshotai/Kimi-K2.6',
+    enableVision: false,
+  };
+
+  const configPath = resolve(__dirname, 'config.json');
+  if (existsSync(configPath)) {
+    try {
+      const user = JSON.parse(readFileSync(configPath, 'utf-8'));
+      Object.assign(defaults, user);
+    } catch (e) {
+      console.error('[config] Failed to parse config.json:', e.message);
+    }
+  }
+
+  // 环境变量覆写
+  if (process.env.CC_API_KEY) defaults.apiKey = process.env.CC_API_KEY;
+  if (process.env.PORT) defaults.port = parseInt(process.env.PORT);
+  if (process.env.HOST) defaults.host = process.env.HOST;
+  if (process.env.CC_API_BASE) defaults.apiBase = process.env.CC_API_BASE;
+  if (process.env.PROJECT_SLUG) defaults.projectSlug = process.env.PROJECT_SLUG;
+  if (process.env.LOG_FILE) defaults.logFile = process.env.LOG_FILE;
+  if (process.env.CC_USE_PROVIDER_MODELS) defaults.useProviderModels = process.env.CC_USE_PROVIDER_MODELS !== 'false';
+  if (process.env.CC_VISION_MODEL) defaults.visionModel = process.env.CC_VISION_MODEL;
+  if (process.env.CC_ENABLE_VISION) defaults.enableVision = process.env.CC_ENABLE_VISION !== 'false';
+
+  return defaults;
+}
+
+const CFG = loadConfig();
+const CC_VERSION = '0.32.3';
+
+// ── 日志 ─────────────────────────────────────────────
+function log(level, msg, data) {
+  const line = `[${new Date().toISOString()}] [${level}] ${msg}${data ? ' ' + JSON.stringify(data) : ''}`;
+  console.log(line);
+  if (CFG.logFile) {
+    try { appendFileSync(CFG.logFile, line + '\n', 'utf-8'); } catch {}
+  }
+}
+
+// ── 会话管理 ───────────────────────────────────────
+// Session 固定 2h 过期 + 30min 随机抖动
+// 同一 session 周期内复用，到期自动换新
+const SESSION_DURATION_MS = 2 * 60 * 60 * 1000;     // 2h
+const SESSION_JITTER_MS  = 30 * 60 * 1000;           // 30min 抖动范围
+
+let currentSession = null;
+let sessionExpiresAt = 0;
+
+function ensureSession() {
+  const now = Date.now();
+  if (now < sessionExpiresAt && currentSession) return currentSession;
+
+  // 过期或第一次：生成新 session
+  const jitter = Math.floor(Math.random() * SESSION_JITTER_MS);
+  currentSession = randomUUID();
+  sessionExpiresAt = now + SESSION_DURATION_MS + jitter;
+  return currentSession;
+}
+
+function getSessionId(incomingHeaders) {
+  // 优先从客户端传来的 session 类 header 获取
+  const candidates = [
+    incomingHeaders['x-session-id'],
+    incomingHeaders['x-claude-code-session-id'],
+    incomingHeaders['openai-session-id'],
+    incomingHeaders['x-request-id'],
+  ];
+  for (const id of candidates) {
+    if (id && typeof id === 'string' && id.length >= 8) return id;
+  }
+  // 无客户端 session，走进程级 session 管理
+  return ensureSession();
+}
+
+// 每个请求独立 thread ID
+function newThreadId() { return randomUUID(); }
+
+// ── 模型列表 ───────────────────────────────────────
+const MODELS = [
+  // Anthropic
+  { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
+  { id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
+  { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
+  { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5' },
+  // OpenAI
+  { id: 'gpt-5.5', name: 'GPT-5.5' },
+  { id: 'gpt-5.4', name: 'GPT-5.4' },
+  { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
+  { id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex' },
+  // DeepSeek
+  { id: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
+  { id: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+  // Kimi
+  { id: 'moonshotai/Kimi-K2.6', name: 'Kimi K2.6' },
+  { id: 'moonshotai/Kimi-K2.5', name: 'Kimi K2.5' },
+  // GLM
+  { id: 'zai-org/GLM-5.1', name: 'GLM 5.1' },
+  { id: 'zai-org/GLM-5', name: 'GLM 5' },
+  // MiniMax
+  { id: 'MiniMaxAI/MiniMax-M3', name: 'MiniMax M3' },
+  { id: 'MiniMaxAI/MiniMax-M2.7', name: 'MiniMax M2.7' },
+  { id: 'MiniMaxAI/MiniMax-M2.5', name: 'MiniMax M2.5' },
+  // Qwen
+  { id: 'Qwen/Qwen3.6-Max-Preview', name: 'Qwen 3.6 Max Preview' },
+  { id: 'Qwen/Qwen3.6-Plus', name: 'Qwen 3.6 Plus' },
+  { id: 'Qwen/Qwen3.7-Max', name: 'Qwen 3.7 Max' },
+  // Step
+  { id: 'stepfun/Step-3.7-Flash', name: 'Step 3.7 Flash' },
+  { id: 'stepfun/Step-3.5-Flash', name: 'Step 3.5 Flash' },
+  // Xiaomi
+  { id: 'xiaomi/mimo-v2.5-pro', name: 'MiMo V2.5 Pro' },
+  { id: 'xiaomi/mimo-v2.5', name: 'MiMo V2.5' },
+  // Gemini
+  { id: 'google/gemini-3.5-flash', name: 'Gemini 3.5 Flash' },
+  { id: 'google/gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite' },
+];
+
+// ── 工具函数 ───────────────────────────────────────
+
+function generateTraceparent() {
+  const traceId = crypto.randomBytes(16).toString('hex');
+  const parentId = crypto.randomBytes(8).toString('hex');
+  return `00-${traceId}-${parentId}-01`;
+}
+
+function nowUnix() {
+  return Math.floor(Date.now() / 1000);
+}
+
+function getDateStr() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function getEnvironment() {
+  return `${process.platform}-${process.arch}, Node.js ${process.version.slice(1)}`;
+}
+
+// ── CC 请求体构建 ─────────────────────────────────
+
+function buildCcRequest(openaiReq) {
+  const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls } = openaiReq;
+
+  // 从 messages 中提取 system prompt
+  const systemMsgs = messages.filter(m => m.role === 'system');
+  const systemPrompt = systemMsgs.map(m => m.content).join('\n');
+  const chatMessages = messages.filter(m => m.role !== 'system');
+
+  // Build tool_call_id → tool_name reverse lookup
+  const toolNameMap = {};
+  for (const msg of chatMessages) {
+    if (msg.role === 'assistant' && msg.tool_calls) {
+      for (const tc of msg.tool_calls) {
+        if (tc.id) {
+          toolNameMap[tc.id] = tc.function?.name || '';
+        }
+      }
+    }
+  }
+
+  // 转换 messages 为 CC 格式
+  const ccMessages = chatMessages.map(msg => {
+    if (msg.role === 'user') {
+      if (typeof msg.content === 'string') {
+        return { role: 'user', content: [{ type: 'text', text: msg.content }] };
+      }
+      // 多模态：数组 content 原样透传（text + image_url → CC image 格式）
+      if (Array.isArray(msg.content)) {
+        const parts = msg.content.map(part => {
+          if (part.type === 'image_url') {
+            const url = part.image_url?.url || '';
+            // CC CLI 真实格式: { type: "image", image: "data:image/jpeg;base64,..." }
+            return { type: 'image', image: url };
+          }
+          return part;
+        }).filter(Boolean);
+        return { role: 'user', content: parts };
+      }
+      return { role: 'user', content: [{ type: 'text', text: String(msg.content) }] };
+    }
+    if (msg.role === 'assistant') {
+      const parts = [];
+      if (msg.content && typeof msg.content === 'string') {
+        parts.push({ type: 'text', text: msg.content });
+      } else if (msg.content && Array.isArray(msg.content)) {
+        for (const part of msg.content) {
+          if (part.type === 'text') parts.push(part);
+        }
+      }
+      if (msg.tool_calls) {
+        for (const tc of msg.tool_calls) {
+          parts.push({
+            type: 'tool-call',
+            toolCallId: tc.id,
+            toolName: tc.function?.name || '',
+            input: (typeof tc.function?.arguments === 'string' ? tryParseJSON(tc.function.arguments) : (tc.function?.arguments || {})),
+          });
+        }
+      }
+      return { role: 'assistant', content: parts };
+    }
+    if (msg.role === 'tool') {
+      return {
+        role: 'tool',
+        content: [{
+          type: 'tool-result',
+          toolCallId: msg.tool_call_id,
+          toolName: toolNameMap[msg.tool_call_id] || msg.name || '',
+          output: { type: 'text', value: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content) },
+        }],
+      };
+    }
+    return msg;
+  });
+
+    const threadId = newThreadId();
+
+  const body = {
+    config: {
+      workingDir: process.cwd(),
+      date: getDateStr(),
+      environment: getEnvironment(),
+      structure: [],
+      isGitRepo: false,
+      currentBranch: '',
+      mainBranch: '',
+      gitStatus: '',
+      recentCommits: [],
+    },
+    memory: '',
+    taste: '',
+    skills: '',
+    permissionMode: 'standard',
+    params: {
+      model: model || 'deepseek/deepseek-v4-flash',
+      messages: ccMessages,
+      max_tokens: Math.min(max_tokens || 64000, 200000),
+      stream: true,  // CC API 总是 stream
+    },
+    threadId,
+  };
+
+  // 条件字段
+  if (systemPrompt) {
+    body.params.system = systemPrompt;
+  }
+  if (temperature !== undefined) {
+    body.params.temperature = temperature;
+  }
+  if (reasoning_effort !== undefined) {
+    body.params.reasoning_effort = reasoning_effort;
+  }
+  if (tools && tools.length > 0) {
+    body.params.tools = tools.map(t => ({
+      type: t.type || 'function',
+      name: t.function?.name || t.name,
+      description: t.function?.description || t.description || '',
+      input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
+    }));
+  }
+if (tool_choice !== undefined) {
+  // OpenAI 格式 → CC (Anthropic 风格) 格式
+  if (typeof tool_choice === 'string') {
+    const map = { 'auto': 'auto', 'none': 'none', 'required': 'any' };
+    body.params.tool_choice = { type: map[tool_choice] || 'auto' };
+  } else if (tool_choice.type === 'function') {
+    // OpenAI object → Anthropic object
+    body.params.tool_choice = { type: 'tool', name: tool_choice.function?.name };
+  } else {
+    body.params.tool_choice = tool_choice;
+  }
+}
+  if (parallel_tool_calls !== undefined) {
+    body.params.parallel_tool_calls = parallel_tool_calls;
+  }
+
+  return body;
+}
+
+function tryParseJSON(str) {
+  try { return JSON.parse(str); } catch { return {}; }
+}
+
+// ── Vision Pipeline ─────────────────────────────────
+
+function hasImages(messages) {
+  for (const msg of messages) {
+    if (Array.isArray(msg.content)) {
+      for (const part of msg.content) {
+        if (part.type === 'image_url') return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Send a single image to the vision model, get back a text description.
+ * Used internally by processImages().
+ */
+async function describeImage(imageUrlObj, visionModel, apiKey, incomingHeaders) {
+  const visionOpenAiReq = {
+    model: visionModel,
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Please describe this image in detail.' },
+          { type: 'image_url', image_url: imageUrlObj },
+        ],
+      },
+    ],
+    max_tokens: 1000,
+  };
+
+  const ccBody = buildCcRequest(visionOpenAiReq);
+  const ccResponse = await forwardToCC(ccBody, apiKey, incomingHeaders);
+
+  if (!ccResponse.ok) {
+    const errorText = await ccResponse.text().catch(() => '');
+    throw new Error(`Vision API error (${ccResponse.status}): ${errorText.slice(0, 200)}`);
+  }
+
+  // Parse NDJSON stream — CC always streams
+  let fullText = '';
+  const reader = ccResponse.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop() || '';
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed === '[DONE]' || trimmed.startsWith(':')) continue;
+      try {
+        const event = JSON.parse(trimmed);
+        if (event.type === 'text-delta') fullText += event.text || '';
+      } catch { /* skip malformed lines */ }
+    }
+  }
+  // Process remaining buffer
+  if (buf.trim()) {
+    try {
+      const event = JSON.parse(buf.trim());
+      if (event.type === 'text-delta') fullText += event.text || '';
+    } catch { /* skip */ }
+  }
+
+  return fullText.trim() || 'No description available';
+}
+
+/**
+ * Scan all messages for image_url content blocks, send each image to the
+ * vision model, and replace the image block with a text description.
+ */
+async function processImages(messages, visionModel, apiKey, incomingHeaders) {
+  // Deep clone to avoid mutating the original request
+  const result = JSON.parse(JSON.stringify(messages));
+
+  for (const msg of result) {
+    if (!Array.isArray(msg.content)) continue;
+
+    // Quick check: does this message have any image_url at all?
+    let hasImage = false;
+    for (const part of msg.content) {
+      if (part.type === 'image_url') { hasImage = true; break; }
+    }
+    if (!hasImage) continue;
+
+    // Rebuild content array, replacing each image_url with a text description
+    const newContent = [];
+    for (const part of msg.content) {
+      if (part.type === 'image_url') {
+        const description = await describeImage(part.image_url, visionModel, apiKey, incomingHeaders);
+        newContent.push({ type: 'text', text: `[Image description: ${description}]` });
+      } else {
+        newContent.push(part);
+      }
+    }
+    msg.content = newContent;
+  }
+
+  return result;
+}
+
+// ── CC NDJSON → OpenAI SSE 转换 ────────────────────
+
+function createSseTranslator(model, completionId, created) {
+  let chunkIndex = 0;
+  let sentRole = false;
+  let finishReason = null;
+  let usage = null;
+  let toolCallIndex = 0;
+
+  return {
+    /** 解析一行 NDJSON，返回 OpenAI chunk 数组 */
+    parseLine(line) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed === '[DONE]' || trimmed.startsWith(':')) return null;
+
+      let event;
+      try { event = JSON.parse(trimmed); } catch { return null; }
+      if (!event.type) return null;
+
+      const out = [];
+
+      switch (event.type) {
+        case 'text-start':
+        case 'reasoning-start':
+        case 'start':
+        case 'start-step':
+          // 忽略，无用户可见内容
+          break;
+
+        case 'text-delta': {
+          const text = event.text || event.delta || '';
+          if (!text) break;
+          const delta = chunkIndex === 0 ? { role: 'assistant', content: text } : { content: text };
+          chunkIndex++;
+          sentRole = true;
+          out.push(makeChunk(completionId, created, model, delta, null, null));
+          break;
+        }
+
+        case 'reasoning-delta': {
+          const text = event.text || '';
+          if (!text) break;
+          const delta = chunkIndex === 0
+            ? { role: 'assistant', reasoning_content: text }
+            : { reasoning_content: text };
+          chunkIndex++;
+          out.push(makeChunk(completionId, created, model, delta, null, null));
+          break;
+        }
+
+        case 'tool-call': {
+          const id = event.toolCallId || `call_${Date.now()}_${toolCallIndex}`;
+          const name = event.toolName || '';
+          const args = typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {});
+          const tcEntry = { index: toolCallIndex, id, type: 'function', function: { name, arguments: args } };
+          const delta = chunkIndex === 0
+            ? { role: 'assistant', content: null, tool_calls: [tcEntry] }
+            : { tool_calls: [tcEntry] };
+          chunkIndex++;
+          toolCallIndex++;
+          out.push(makeChunk(completionId, created, model, delta, null, null));
+          break;
+        }
+
+        case 'finish-step': {
+          if (event.finishReason) finishReason = mapFinishReason(event.finishReason);
+          if (event.usage) usage = event.usage;
+          break;
+        }
+
+        case 'finish': {
+          const fr = finishReason || mapFinishReason(event.finishReason || 'stop');
+          const u = event.totalUsage || usage;
+          const openaiUsage = u ? {
+            prompt_tokens: u.inputTokens ?? 0,
+            completion_tokens: u.outputTokens ?? 0,
+            total_tokens: (u.inputTokens ?? 0) + (u.outputTokens ?? 0),
+          } : undefined;
+          out.push(makeChunk(completionId, created, model, {}, fr, openaiUsage));
+          break;
+        }
+
+        case 'error': {
+          const msg = event.error?.message || event.message || 'Unknown error';
+          log('warn', 'CC stream error', { message: msg });
+          // 发送错误但不塞进 content 里，以 finish_reason 结束
+          out.push(makeChunk(completionId, created, model, {}, 'stop', null));
+          break;
+        }
+      }
+
+      return out.length > 0 ? out : null;
+    },
+
+    /** 获取 SSE 结束标记 */
+    getDoneEvent() {
+      return 'data: [DONE]\n\n';
+    },
+  };
+}
+
+function makeChunk(id, created, model, delta, finishReason, usage) {
+  const chunk = {
+    id,
+    object: 'chat.completion.chunk',
+    created,
+    model,
+    choices: [{ index: 0, delta, finish_reason: finishReason || null }],
+  };
+  if (usage) chunk.usage = usage;
+  return `data: ${JSON.stringify(chunk)}\n\n`;
+}
+
+function mapFinishReason(reason) {
+  switch (reason) {
+    case 'tool-calls': return 'tool_calls';
+    case 'length': return 'length';
+    case 'stop': return 'stop';
+    default: return reason || 'stop';
+  }
+}
+
+// ── 错误映射 ───────────────────────────────────────
+const CC_STATUS_MAP = {
+  400: { status: 400, type: 'invalid_request_error' },
+  401: { status: 401, type: 'authentication_error' },
+  402: { status: 429, type: 'rate_limit_error' },       // payment required → rate limit
+  403: { status: 401, type: 'authentication_error' },
+  404: { status: 404, type: 'not_found' },
+  422: { status: 400, type: 'invalid_request_error' },
+  429: { status: 429, type: 'rate_limit_error' },
+  500: { status: 502, type: 'upstream_error' },
+  502: { status: 502, type: 'upstream_error' },
+  503: { status: 503, type: 'temporarily_unavailable' },
+};
+
+function mapCcError(ccStatus, ccBody) {
+  const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
+  let message = `CC API error (${ccStatus})`;
+
+  if (ccBody) {
+    try {
+      const parsed = JSON.parse(ccBody);
+      message = parsed.error?.message || parsed.message || message;
+    } catch {
+      message = ccBody.slice(0, 200) || message;
+    }
+  }
+
+  // CC 429 响应可能带 retry-after
+  if (ccStatus === 429) {
+    return {
+      status: 429,
+      body: {
+        error: { message, type: 'rate_limit_error' },
+        retry_after: 30,
+      },
+    };
+  }
+
+  return { status: mapped.status, body: { error: { message, type: mapped.type } } };
+}
+
+// ── HTTP 请求处理 ──────────────────────────────────
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
+      catch { reject(new Error('Invalid JSON')); }
+    });
+    req.on('error', reject);
+  });
+}
+
+function sendJSON(res, status, data) {
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(data));
+}
+
+function getApiKey(headers) {
+  const auth = headers['authorization'] || headers['Authorization'] || '';
+  const raw = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  // 如果客户端传的是占位 Key，替换为真实 Key
+  if (raw && CFG.apiKey && isPlaceholderKey(raw)) return CFG.apiKey;
+  return raw;
+}
+
+function isPlaceholderKey(key) {
+  // 识别常见的占位 Key 格式
+  if (key.startsWith('sk-')) return true;
+  if (key === 'cc-proxy' || key === 'test' || key === 'key') return true;
+  if (key.length < 20) return true;  // 真实 CC Key 远长于此
+  return false;
+}
+
+// ── 流式转发 ────────────────────────────────────────
+
+async function forwardToCC(body, apiKey, incomingHeaders = {}) {
+  const url = `${CFG.apiBase}/alpha/generate`;
+  const traceparent = generateTraceparent();
+  const sessionId = getSessionId(incomingHeaders);
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+      'x-cli-environment': 'production',
+      'x-command-code-version': CC_VERSION,
+      'x-session-id': sessionId,
+      'x-co-flag': 'false',
+      'x-taste-learning': 'false',
+      'x-project-slug': CFG.projectSlug,
+      'traceparent': traceparent,
+    },
+    body: JSON.stringify(body),
+  });
+
+  return response;
+}
+
+// ── 路由 ────────────────────────────────────────────
+
+async function handleChatCompletions(req, res) {
+  let openaiReq;
+  try {
+    openaiReq = await readBody(req);
+  } catch {
+    sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+    return;
+  }
+
+  const apiKey = getApiKey(req.headers) || CFG.apiKey;
+  if (!apiKey) {
+    sendJSON(res, 401, { error: { message: 'Missing API key. Set in Authorization header or config.json', type: 'auth_error' } });
+    return;
+  }
+
+  const stream = openaiReq.stream === true;
+  const model = openaiReq.model || 'deepseek/deepseek-v4-flash';
+  const completionId = `chatcmpl-${randomUUID().slice(0, 12)}`;
+  const created = nowUnix();
+
+  // 构建 CC 请求体
+  const ccBody = buildCcRequest(openaiReq);
+
+  try {
+    // 转发到 CC API（传入客户端 headers，用于提取 session ID）
+    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers);
+
+    if (!ccResponse.ok) {
+      const errorText = await ccResponse.text().catch(() => '');
+      log('error', 'CC API error', { status: ccResponse.status, body: errorText.slice(0, 200) });
+      const mapped = mapCcError(ccResponse.status, errorText);
+      sendJSON(res, mapped.status, mapped.body);
+      return;
+    }
+
+    const STREAM_IDLE_TIMEOUT_MS = 30000;   // 30s — 流式无新数据中断
+    const NONSTREAM_IDLE_TIMEOUT_MS = 90000; // 90s — 非流式超时更宽容
+
+    if (stream) {
+      // ── 流式响应 ──
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+      const translator = createSseTranslator(model, completionId, created);
+      let buffer = '';
+      const decoder = new TextDecoder();
+      const reader = ccResponse.body.getReader();
+
+      try {
+        while (true) {
+          // 30s 超时：如果 CC 上游无新数据，自动中断流
+          const result = await Promise.race([
+            reader.read(),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), STREAM_IDLE_TIMEOUT_MS)
+            ),
+          ]);
+          const { done, value } = result;
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            const events = translator.parseLine(line);
+            if (events) {
+              for (const evt of events) res.write(evt);
+            }
+          }
+        }
+
+        // 处理剩余 buffer
+        if (buffer.trim()) {
+          const events = translator.parseLine(buffer);
+          if (events) {
+            for (const evt of events) res.write(evt);
+          }
+        }
+
+        res.write(translator.getDoneEvent());
+      } catch (e) {
+        // 流中断，尝试发个结束标记
+        if (!res.writableEnded) {
+          try { res.write(`data: ${JSON.stringify({ id: completionId, object: 'chat.completion.chunk', created, model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`); } catch {}
+          try { res.write('data: [DONE]\n\n'); } catch {}
+        }
+      }
+
+      if (!res.writableEnded) res.end();
+    } else {
+      // ── 非流式响应（缓冲完整 NDJSON）──
+      let fullText = '';
+      let finishReason = 'stop';
+      let usage = null;
+      let toolCalls = null;
+
+      const reader = ccResponse.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+
+      const processLines = () => {
+        const lines = buf.split('\n');
+        buf = lines.pop() || '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed === '[DONE]' || trimmed.startsWith(':')) continue;
+          try {
+            const event = JSON.parse(trimmed);
+            switch (event.type) {
+              case 'text-delta': fullText += event.text || ''; break;
+              case 'tool-call':
+                toolCalls = toolCalls || [];
+                toolCalls.push({
+                  id: event.toolCallId || ('call_' + Date.now() + '_' + toolCalls.length),
+                  type: 'function',
+                  function: {
+                    name: event.toolName || '',
+                    arguments: typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {}),
+                  },
+                });
+                break;
+              case 'finish':
+                finishReason = mapFinishReason(event.finishReason || 'stop');
+                if (event.totalUsage) usage = event.totalUsage;
+                break;
+              case 'error':
+                log('warn', 'CC stream error (non-stream)', { message: event.error?.message || event.message });
+                break;
+            }
+          } catch {}
+        }
+      };
+
+      while (true) {
+        const result = await Promise.race([
+          reader.read(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), NONSTREAM_IDLE_TIMEOUT_MS)
+          ),
+        ]);
+        const { done, value } = result;
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        processLines();
+      }
+      processLines();
+
+      sendJSON(res, 200, {
+        id: completionId,
+        object: 'chat.completion',
+        created,
+        model,
+        choices: [{
+          index: 0,
+          message: { role: 'assistant', content: fullText || null, ...(toolCalls ? { tool_calls: toolCalls } : {}) },
+          finish_reason: finishReason,
+        }],
+        usage: usage ? {
+          prompt_tokens: usage.inputTokens ?? 0,
+          completion_tokens: usage.outputTokens ?? 0,
+          total_tokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
+        } : undefined,
+      });
+    }
+  } catch (e) {
+    sendJSON(res, 502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error' } });
+  }
+}
+
+// ── Anthropic /v1/messages 协议转换 ─────────────────
+
+function mapAnthropicStopReason(finishReason) {
+  switch (finishReason) {
+    case 'tool_calls': return 'tool_use';
+    case 'length': return 'max_tokens';
+    case 'stop': return 'end_turn';
+    default: return 'end_turn';
+  }
+}
+
+function buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage) {
+  const content = [];
+  if (fullText) content.push({ type: 'text', text: fullText });
+  if (toolCalls) {
+    for (const tc of toolCalls) {
+      let input = {};
+      try { input = JSON.parse(tc.function.arguments); } catch { input = {}; }
+      content.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
+    }
+  }
+  return {
+    id: `msg_${randomUUID().slice(0, 12)}`,
+    type: 'message',
+    role: 'assistant',
+    model,
+    content,
+    stop_reason: mapAnthropicStopReason(finishReason || 'stop'),
+    stop_sequence: null,
+    usage: {
+      input_tokens: usage?.inputTokens ?? 0,
+      output_tokens: usage?.outputTokens ?? 0,
+    },
+  };
+}
+
+function convertAnthropicToOpenAI(anthropicReq) {
+  // 1. Extract system prompt (top-level, not in messages array)
+  let systemPrompt = '';
+  if (anthropicReq.system) {
+    if (typeof anthropicReq.system === 'string') {
+      systemPrompt = anthropicReq.system;
+    } else if (Array.isArray(anthropicReq.system)) {
+      systemPrompt = anthropicReq.system
+        .filter(b => b.type === 'text')
+        .map(b => b.text)
+        .join('\n');
+    }
+  }
+
+  // 2. Build tool name map + convert messages
+  const toolNameFromId = {};
+  const openaiMessages = [];
+
+  if (systemPrompt) {
+    openaiMessages.push({ role: 'system', content: systemPrompt });
+  }
+
+  const messages = anthropicReq.messages || [];
+  for (const msg of messages) {
+    if (msg.role === 'assistant') {
+      let textContent = '';
+      const toolCalls = [];
+      const blocks = Array.isArray(msg.content) ? msg.content : [{ type: 'text', text: msg.content || '' }];
+      for (const block of blocks) {
+        if (block.type === 'text') {
+          textContent += block.text || '';
+        } else if (block.type === 'tool_use') {
+          toolNameFromId[block.id] = block.name;
+          toolCalls.push({
+            id: block.id,
+            type: 'function',
+            function: {
+              name: block.name,
+              arguments: JSON.stringify(block.input || {}),
+            },
+          });
+        }
+      }
+      const assistantMsg = { role: 'assistant', content: textContent || null };
+      if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
+      openaiMessages.push(assistantMsg);
+    } else if (msg.role === 'user') {
+      let textContent = '';
+      const toolResults = [];
+      if (typeof msg.content === 'string') {
+        textContent = msg.content;
+      } else if (Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (block.type === 'text') {
+            textContent += block.text || '';
+          } else if (block.type === 'tool_result') {
+            toolResults.push(block);
+          }
+        }
+      }
+      if (textContent) {
+        openaiMessages.push({ role: 'user', content: textContent });
+      }
+      for (const tr of toolResults) {
+        const toolContent = typeof tr.content === 'string' ? tr.content
+          : Array.isArray(tr.content) ? tr.content.map(c => c.text || '').join('')
+          : String(tr.content || '');
+        openaiMessages.push({
+          role: 'tool',
+          tool_call_id: tr.tool_use_id,
+          name: toolNameFromId[tr.tool_use_id] || '',
+          content: toolContent,
+        });
+      }
+    }
+  }
+
+  // 3. Build OpenAI request
+  const openaiReq = {
+    model: anthropicReq.model || 'deepseek/deepseek-v4-flash',
+    messages: openaiMessages,
+    max_tokens: anthropicReq.max_tokens || 64000,
+    stream: anthropicReq.stream === true,
+  };
+
+  // 4. Map tools
+  if (anthropicReq.tools && anthropicReq.tools.length > 0) {
+    openaiReq.tools = anthropicReq.tools.map(t => ({
+      type: 'function',
+      function: {
+        name: t.name,
+        description: t.description || '',
+        parameters: t.input_schema || { type: 'object', properties: {} },
+      },
+    }));
+  }
+
+  // 5. Map tool_choice
+  if (anthropicReq.tool_choice) {
+    const tc = anthropicReq.tool_choice;
+    if (tc.type === 'auto' || tc.type === undefined) {
+      openaiReq.tool_choice = 'auto';
+    } else if (tc.type === 'any') {
+      openaiReq.tool_choice = 'required';
+    } else if (tc.type === 'tool') {
+      openaiReq.tool_choice = { type: 'function', function: { name: tc.name } };
+    } else if (tc.type === 'none') {
+      openaiReq.tool_choice = 'none';
+    }
+  }
+
+  // 6. Optional params
+  if (anthropicReq.temperature !== undefined) openaiReq.temperature = anthropicReq.temperature;
+  if (anthropicReq.top_p !== undefined) openaiReq.top_p = anthropicReq.top_p;
+  if (anthropicReq.stop_sequences) openaiReq.stop = anthropicReq.stop_sequences;
+  if (anthropicReq.metadata?.user_id) openaiReq.user = anthropicReq.metadata.user_id;
+
+  return openaiReq;
+}
+
+/**
+ * Async generator that reads CC NDJSON response body and yields
+ * Anthropic SSE events for streaming.
+ */
+async function* createAnthropicSseTranslator(response, model) {
+  let nextBlockIndex = 0;
+  let currentBlockIndex = -1;
+  let currentBlockType = null;
+  let blockStarted = false;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let stopReason = null;
+  let hasError = false;
+  const messageId = `msg_${randomUUID().slice(0, 12)}`;
+
+  // Close the current text block if one is active
+  function closeTextBlock() {
+    if (blockStarted && currentBlockType === 'text') {
+      blockStarted = false;
+      currentBlockType = null;
+      return `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: currentBlockIndex })}\n\n`;
+    }
+    return '';
+  }
+
+  // Open a new text block (closing any previous block first)
+  function startTextBlock() {
+    if (!blockStarted || currentBlockType !== 'text') {
+      const close = closeTextBlock();
+      currentBlockIndex = nextBlockIndex++;
+      currentBlockType = 'text';
+      blockStarted = true;
+      return close + `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: currentBlockIndex, content_block: { type: 'text', text: '' } })}\n\n`;
+    }
+    return '';
+  }
+
+  // Emit message_start (always the first event)
+  yield `event: message_start\ndata: ${JSON.stringify({
+    type: 'message_start',
+    message: {
+      id: messageId,
+      type: 'message',
+      role: 'assistant',
+      content: [],
+      model,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    }
+  })}\n\n`;
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed === '[DONE]') continue;
+      let event;
+      try { event = JSON.parse(trimmed); } catch { continue; }
+      if (!event.type) continue;
+
+      switch (event.type) {
+        case 'start': case 'start-step': case 'text-start': case 'reasoning-start':
+          // Signal events, no user-visible data
+          break;
+
+        case 'reasoning-delta':
+          // Anthropic Messages API default mode doesn't expose thinking blocks
+          break;
+
+        case 'text-delta': {
+          const text = event.text || '';
+          if (!text) break;
+          const startBlock = startTextBlock();
+          if (startBlock) yield startBlock;
+          yield `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'text_delta', text } })}\n\n`;
+          outputTokens += Math.ceil(text.length / 4);
+          break;
+        }
+
+        case 'tool-call': {
+          // Close any pending text block
+          const closeBlock = closeTextBlock();
+          if (closeBlock) yield closeBlock;
+
+          const id = event.toolCallId || `toolu_${randomUUID().slice(0, 12)}`;
+          const name = event.toolName || '';
+          const input = typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {});
+
+          const tcIndex = nextBlockIndex++;
+
+          yield `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: tcIndex, content_block: { type: 'tool_use', id, name, input: {} } })}\n\n`;
+          yield `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: tcIndex, delta: { type: 'input_json_delta', partial_json: input } })}\n\n`;
+          yield `event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: tcIndex })}\n\n`;
+
+          outputTokens += 20;
+          break;
+        }
+
+        case 'finish-step':
+        case 'finish': {
+          if (event.finishReason) stopReason = mapAnthropicStopReason(event.finishReason);
+          const u = event.totalUsage || event.usage;
+          if (u) {
+            inputTokens = u.inputTokens ?? inputTokens;
+            outputTokens = u.outputTokens ?? outputTokens;
+          }
+          break;
+        }
+
+        case 'error': {
+          hasError = true;
+          const msg = event.error?.message || event.message || 'Unknown CC error';
+          yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'internal_error', message: msg } })}\n\n`;
+          break;
+        }
+      }
+    }
+  }
+
+  // Finalize — close pending text block, emit message_delta + message_stop
+  if (!hasError) {
+    const closeBlock = closeTextBlock();
+    if (closeBlock) yield closeBlock;
+
+    yield `event: message_delta\ndata: ${JSON.stringify({
+      type: 'message_delta',
+      delta: { stop_reason: stopReason || 'end_turn' },
+      usage: { output_tokens: outputTokens },
+    })}\n\n`;
+
+    yield `event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`;
+  }
+}
+
+function sendAnthropicError(res, status, type, message) {
+  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ type: 'error', error: { type, message } }));
+}
+
+async function handleMessages(req, res) {
+  let anthropicReq;
+  try {
+    anthropicReq = await readBody(req);
+  } catch {
+    sendAnthropicError(res, 400, 'invalid_request_error', 'Invalid JSON body');
+    return;
+  }
+
+  const apiKey = getApiKey(req.headers) || CFG.apiKey;
+  if (!apiKey) {
+    sendAnthropicError(res, 401, 'authentication_error', 'Missing API key');
+    return;
+  }
+
+  const stream = anthropicReq.stream === true;
+  const model = anthropicReq.model || 'claude-sonnet-4-6';
+
+  // Convert Anthropic → OpenAI → CC
+  const openaiReq = convertAnthropicToOpenAI(anthropicReq);
+  const ccBody = buildCcRequest(openaiReq);
+
+  try {
+    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers);
+
+    if (!ccResponse.ok) {
+      const errorText = await ccResponse.text().catch(() => '');
+      log('error', 'CC API error (Anthropic)', { status: ccResponse.status, body: errorText.slice(0, 200) });
+      const mapped = mapCcError(ccResponse.status, errorText);
+      sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
+      return;
+    }
+
+    if (stream) {
+      // ── 流式 Anthropic SSE ──
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+
+      try {
+        const generator = createAnthropicSseTranslator(ccResponse, model);
+        for await (const event of generator) {
+          res.write(event);
+        }
+      } catch (e) {
+        if (!res.writableEnded) {
+          try {
+            res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'internal_error', message: e.message } })}\n\n`);
+          } catch {}
+        }
+      }
+
+      if (!res.writableEnded) res.end();
+    } else {
+      // ── 非流式 Anthropic JSON ──
+      let fullText = '';
+      let finishReason = 'stop';
+      let usage = null;
+      let toolCalls = null;
+
+      const reader = ccResponse.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+
+      const processLines = () => {
+        const lines = buf.split('\n');
+        buf = lines.pop() || '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed === '[DONE]') continue;
+          try {
+            const event = JSON.parse(trimmed);
+            switch (event.type) {
+              case 'text-delta': fullText += event.text || ''; break;
+              case 'tool-call':
+                (toolCalls = toolCalls || []).push({
+                  id: event.toolCallId || ('call_' + Date.now() + '_' + toolCalls.length),
+                  type: 'function',
+                  function: {
+                    name: event.toolName || '',
+                    arguments: typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {}),
+                  },
+                });
+                break;
+              case 'finish':
+                finishReason = mapFinishReason(event.finishReason || 'stop');
+                if (event.totalUsage) usage = event.totalUsage;
+                break;
+              case 'error':
+                log('warn', 'CC error (Anthropic non-stream)', { message: event.error?.message || event.message });
+                break;
+            }
+          } catch {}
+        }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        processLines();
+      }
+      processLines();
+
+      sendJSON(res, 200, buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage));
+    }
+  } catch (e) {
+    sendAnthropicError(res, 502, 'proxy_error', `Upstream error: ${e.message}`);
+  }
+}
+
+// ── 动态模型列表 ────────────────────────────────────
+
+let dynamicModels = null;
+let modelsLastFetch = 0;
+
+async function fetchModels() {
+  const now = Date.now();
+  if (dynamicModels && (now - modelsLastFetch) < CFG.modelRefreshIntervalMs) {
+    return dynamicModels;
+  }
+
+  try {
+    const apiKey = CFG.apiKey;
+    if (!apiKey || !CFG.useProviderModels) throw new Error('Provider models disabled');
+
+    const response = await fetch(`${CFG.apiBase}/provider/v1/models`, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'x-cli-environment': 'production',
+        'x-command-code-version': CC_VERSION,
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (response.ok) {
+      const data = await response.json();
+      if (Array.isArray(data.data)) {
+        dynamicModels = data.data.map(m => ({
+          id: m.id,
+          name: m.id,
+        }));
+        modelsLastFetch = now;
+        log('info', 'Fetched models from Provider API', { count: dynamicModels.length });
+        return dynamicModels;
+      }
+    }
+    log('warn', 'Provider models fetch failed, using hardcoded list', { status: response.status });
+  } catch (e) {
+    log('warn', 'Provider models fetch error, using hardcoded list', { error: e.message });
+  }
+
+  // Fallback to hardcoded MODELS
+  return MODELS;
+}
+
+async function handleModels(req, res) {
+  const models = await fetchModels();
+  const now = nowUnix();
+  sendJSON(res, 200, {
+    object: 'list',
+    data: models.map(m => ({
+      id: m.id,
+      object: 'model',
+      created: now,
+      owned_by: 'command-code',
+    })),
+  });
+}
+
+function handleHealth(req, res) {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('OK');
+}
+
+// ── 服务器 ──────────────────────────────────────────
+
+const server = http.createServer(async (req, res) => {
+  // CORS
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  const url = new URL(req.url, `http://${req.headers.host}`);
+
+  try {
+    if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
+      handleChatCompletions(req, res);
+    } else if (url.pathname === '/v1/messages' && req.method === 'POST') {
+      handleMessages(req, res);
+    } else if (url.pathname === '/v1/models' && req.method === 'GET') {
+      await handleModels(req, res);
+    } else if (url.pathname === '/health' || url.pathname === '/') {
+      handleHealth(req, res);
+    } else {
+      sendJSON(res, 404, { error: { message: 'Not found', type: 'not_found' } });
+    }
+  } catch (e) {
+    sendJSON(res, 500, { error: { message: e.message, type: 'internal_error' } });
+  }
+});
+
+server.listen(CFG.port, CFG.host, () => {
+  log('info', 'CC Proxy started', {
+    url: `http://${CFG.host}:${CFG.port}`,
+    api: CFG.apiBase,
+    models: MODELS.length,
+    session: '2h + 30min jitter',
+    logFile: CFG.logFile || '(console only)',
+  });
+  if (!CFG.apiKey) {
+    log('warn', 'No API key configured. Set CC_API_KEY env var or apiKey in config.json');
+  }
+});

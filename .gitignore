@@ -1,0 +1,7 @@
+node_modules/
+*.log
+*.zip
+.omo/
+stdout.txt
+stderr.txt
+
