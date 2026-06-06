@@ -66,8 +66,8 @@ function log(level, msg, data) {
 // ── 会话管理 ───────────────────────────────────────
 // Session 固定 2h 过期 + 30min 随机抖动
 // 同一 session 周期内复用，到期自动换新
-const SESSION_DURATION_MS = 2 * 60 * 60 * 1000;     // 2h
-const SESSION_JITTER_MS  = 30 * 60 * 1000;           // 30min 抖动范围
+const SESSION_DURATION_MS = 12 * 60 * 60 * 1000;    // 12h
+const SESSION_JITTER_MS  = 60 * 60 * 1000;           // 1h 抖动范围
 
 let currentSession = null;
 let sessionExpiresAt = 0;
@@ -964,10 +964,11 @@ async function* createAnthropicSseTranslator(response, model) {
   let currentBlockIndex = -1;
   let currentBlockType = null;
   let blockStarted = false;
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let stopReason = null;
-  let hasError = false;
+let inputTokens = 0;
+let outputTokens = 0;
+let cachedInputTokens = 0;
+let stopReason = null;
+let hasError = false;
   const messageId = `msg_${randomUUID().slice(0, 12)}`;
 
   // Close the current text block if one is active
@@ -1068,6 +1069,7 @@ async function* createAnthropicSseTranslator(response, model) {
           if (u) {
             inputTokens = u.inputTokens ?? inputTokens;
             outputTokens = u.outputTokens ?? outputTokens;
+            cachedInputTokens = u.cachedInputTokens ?? cachedInputTokens;
           }
           break;
         }
@@ -1090,7 +1092,7 @@ async function* createAnthropicSseTranslator(response, model) {
     yield `event: message_delta\ndata: ${JSON.stringify({
       type: 'message_delta',
       delta: { stop_reason: stopReason || 'end_turn' },
-      usage: { output_tokens: outputTokens },
+      usage: { output_tokens: outputTokens, cache_read_input_tokens: cachedInputTokens, input_tokens: inputTokens },
     })}\n\n`;
 
     yield `event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`;
