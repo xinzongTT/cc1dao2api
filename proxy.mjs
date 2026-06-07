@@ -600,12 +600,10 @@ function sendJSON(res, status, data) {
 function getApiKey(headers) {
   const auth = headers['authorization'] || headers['Authorization'] || '';
   if (!auth.startsWith('Bearer ')) return null;
-  const rawKey = auth.slice(7).trim();
-  // 必须以 user_ 开头，后接字母数字
-  if (!/^user_[a-zA-Z0-9_-]+/.test(rawKey)) return null;
-  // 提取到第一个非法字符为止（截断多余路径）
-  const match = rawKey.match(/^user_[a-zA-Z0-9_-]+/);
-  return match ? match[0] : null;
+  // 从字符串中提取第一个 user_ 开头的 Key，自动清理空格/引号/多余路径
+  const match = auth.slice(7).match(/user_[a-zA-Z0-9_-]+/);
+  if (!match) return null;
+  return match[0];
 }
 
 // ── 流式转发 ────────────────────────────────────────
