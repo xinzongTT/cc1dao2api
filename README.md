@@ -323,6 +323,10 @@ print(message.content[0].text)
 }
 ```
 
+## Community
+
+[Linux.do](https://linux.do) — a friendly Chinese tech community where this project was first shared.
+
 ## Anti-Detection
 
 Based on analysis of official CLI v0.32.3 traffic:
@@ -398,8 +402,6 @@ This project is for **educational and research purposes** only.
 - **Account Risk**: Keep usage frequency consistent with normal CLI usage. Extremely high concurrent calls may trigger risk controls.
 
 ---
-
-[Linux.do](https://linux.do)
 
 ## Development
 
