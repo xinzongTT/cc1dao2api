@@ -399,7 +399,7 @@ This project is for **educational and research purposes** only.
 
 ---
 
-Originally shared on [Linux.do](https://linux.do) — a Chinese tech community.
+[Linux.do](https://linux.do)
 
 ## Development
 
