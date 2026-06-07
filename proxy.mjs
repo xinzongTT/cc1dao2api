@@ -726,6 +726,7 @@ async function handleChatCompletions(req, res) {
     } else {
       // ── 非流式响应（缓冲完整 NDJSON）──
       let fullText = '';
+      let reasoningContent = '';
       let finishReason = 'stop';
       let usage = null;
       let toolCalls = null;
@@ -744,6 +745,7 @@ async function handleChatCompletions(req, res) {
             const event = JSON.parse(trimmed);
             switch (event.type) {
               case 'text-delta': fullText += event.text || ''; break;
+              case 'reasoning-delta': reasoningContent += event.text || ''; break;
               case 'tool-call':
                 toolCalls = toolCalls || [];
                 toolCalls.push({
@@ -788,7 +790,11 @@ async function handleChatCompletions(req, res) {
         model,
         choices: [{
           index: 0,
-          message: { role: 'assistant', content: fullText || null, ...(toolCalls ? { tool_calls: toolCalls } : {}) },
+          message: Object.assign(
+            { role: 'assistant', content: fullText || null },
+            toolCalls ? { tool_calls: toolCalls } : {},
+            reasoningContent ? { reasoning_content: reasoningContent } : {},
+          ),
           finish_reason: finishReason,
         }],
     usage: usage ? {
