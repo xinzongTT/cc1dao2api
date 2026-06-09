@@ -427,8 +427,8 @@ function createSseTranslator(model, completionId, created) {
 
         case 'finish': {
           const fr = finishReason || mapFinishReason(event.finishReason || 'stop');
-          const u = event.totalUsage || usage;
-          normalizeUsage(u);
+          const u = event.totalUsage || usage || {};
+          normalizeUsage(u, 'openai-sse-finish');
           const openaiUsage = u ? {
             prompt_tokens: u.inputTokens ?? 0,
             completion_tokens: u.outputTokens ?? 0,
@@ -780,15 +780,16 @@ async function handleChatCompletions(req, res) {
           ),
           finish_reason: finishReason,
         }],
-    usage: usage ? (() => {
-      normalizeUsage(usage);
+    usage: (() => {
+      if (!usage) usage = {};
+      normalizeUsage(usage, 'openai-nonstream');
       return {
         prompt_tokens: usage.inputTokens ?? 0,
         completion_tokens: usage.outputTokens ?? 0,
         total_tokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0),
         prompt_tokens_details: { cached_tokens: usage.cachedInputTokens ?? 0 },
       };
-    })() : undefined,
+    })(),
       });
     }
   } catch (e) {
@@ -833,7 +834,7 @@ function buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage)
     stop_reason: mapAnthropicStopReason(finishReason || 'stop'),
     stop_sequence: null,
     usage: (() => {
-      normalizeUsage(usage);
+      normalizeUsage(usage || {}, 'anthropic-nonstream');
       return {
         input_tokens: usage?.inputTokens ?? 0,
         output_tokens: usage?.outputTokens ?? 0,
@@ -1097,11 +1098,16 @@ async function* createAnthropicSseTranslator(response, model) {
             if (event.finishReason) stopReason = mapAnthropicStopReason(event.finishReason);
             const u = event.totalUsage || event.usage;
             if (u) {
-          normalizeUsage(u, 'openai-sse-finish');
+              normalizeUsage(u, 'anthropic-sse-finish');
               inputTokens = u.inputTokens ?? inputTokens;
               outputTokens = u.outputTokens ?? outputTokens;
               cachedInputTokens = u.cachedInputTokens ?? cachedInputTokens;
               cacheWriteTokens = u.inputTokenDetails?.cacheWriteTokens ?? cacheWriteTokens;
+            } else {
+              inputTokens = 0;
+              outputTokens = 0;
+              cachedInputTokens = 0;
+              cacheWriteTokens = 0;
             }
             break;
           }
