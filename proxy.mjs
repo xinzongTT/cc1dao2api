@@ -489,9 +489,6 @@ function logStreamTimeout(startedAt, model, msgCount, apiKey, reqBody, ccBody, p
     model,
     messages: msgCount,
     durationMs: duration,
-    reqSize: JSON.stringify(reqBody).length,
-    ccBodySize: JSON.stringify(ccBody).length,
-    partialCCResponse: (partialResponse || '').slice(0, 200),
   });
   // 全量写入日志文件
   if (CFG.logFile) {
