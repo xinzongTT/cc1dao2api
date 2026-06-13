@@ -244,8 +244,8 @@ Health check. Returns `OK`.
 |-------------|-------------|
 | 400 | Invalid request format |
 | 401 | API Key missing / invalid format / rejected (Key must start with `user_`) |
-| 408 | Idle timeout (30s streaming / 90s non-streaming) |
-| 429 | Rate limited (consecutive 3 timeouts: reduce context hint) |
+| 408 | — (用 429，见下) |
+| 429 | Idle timeout (30s streaming / 90s non-streaming, consecutive 3: reduce context hint) |
 | 502 | Zero output tokens (empty response from upstream) or CC upstream error |
 | 503 | Service temporarily unavailable |
 
