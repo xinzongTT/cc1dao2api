@@ -5,7 +5,7 @@
 import http from 'http';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
-import { readFileSync, existsSync, appendFileSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, appendFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -46,6 +46,91 @@ function loadConfig() {
 }
 
 const CFG = loadConfig();
+
+// ── 指纹生成（首次运行自动生成，写回 config.json） ──────
+const FINGERPRINT_PLATFORMS = [
+  { platform: 'win32', arch: 'x64', release: ['10.0.19045', '10.0.22621', '10.0.22631', '10.0.26100'] },
+  { platform: 'darwin', arch: 'arm64', release: ['23.0.0', '23.1.0', '23.2.0', '24.0.0', '24.1.0'] },
+  { platform: 'linux', arch: 'x64', release: ['5.15.0', '6.1.0', '6.5.0', '6.6.0', '6.8.0'] },
+];
+const FINGERPRINT_CPUS = [
+  '12th Gen Intel(R) Core(TM) i7-12650H', '13th Gen Intel(R) Core(TM) i7-13700K',
+  '13th Gen Intel(R) Core(TM) i5-13600K', 'Intel(R) Core(TM) Ultra 7 155H',
+  'Intel(R) Core(TM) i9-14900K', 'AMD Ryzen 7 7800X3D', 'AMD Ryzen 9 7950X',
+  'AMD Ryzen 5 7600', 'Apple M1 Pro', 'Apple M2 Max', 'Apple M3 Pro', 'Apple M4',
+];
+const FINGERPRINT_CPUS_COUNT = [4, 6, 8, 10, 12, 14, 16, 20, 24, 32];
+const FINGERPRINT_MEMS = [8, 16, 24, 32, 48, 64];
+const FINGERPRINT_TZS = [
+  'America/New_York', 'America/Chicago', 'America/Los_Angeles', 'America/Toronto',
+  'Europe/London', 'Europe/Berlin', 'Europe/Paris', 'Europe/Moscow',
+  'Asia/Shanghai', 'Asia/Tokyo', 'Asia/Singapore', 'Asia/Seoul', 'Asia/Hong_Kong',
+  'Australia/Sydney', 'Pacific/Auckland',
+];
+const FINGERPRINT_MAC_COUNT_RANGE = [2, 3, 4, 5]; // 随机 2~5 个 MAC
+
+function generateFingerprint() {
+  const plat = FINGERPRINT_PLATFORMS[Math.floor(Math.random() * FINGERPRINT_PLATFORMS.length)];
+  const release = plat.release[Math.floor(Math.random() * plat.release.length)];
+  const cpu = FINGERPRINT_CPUS[Math.floor(Math.random() * FINGERPRINT_CPUS.length)];
+  const cpuCount = FINGERPRINT_CPUS_COUNT[Math.floor(Math.random() * FINGERPRINT_CPUS_COUNT.length)];
+  const memGiB = FINGERPRINT_MEMS[Math.floor(Math.random() * FINGERPRINT_MEMS.length)];
+  const tz = FINGERPRINT_TZS[Math.floor(Math.random() * FINGERPRINT_TZS.length)];
+  const macCount = FINGERPRINT_MAC_COUNT_RANGE[Math.floor(Math.random() * FINGERPRINT_MAC_COUNT_RANGE.length)];
+
+  function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
+  function randHex(n) { return crypto.randomBytes(n).toString('hex'); }
+
+  const macHashes = [];
+  for (let i = 0; i < macCount; i++) macHashes.push(sha256(randHex(32)));
+
+  const machineIdHash = sha256(randHex(32));
+  const osUserHash = sha256(randHex(16));
+  const hostnameHash = sha256(randHex(16));
+  const gitEmailHash = sha256(randHex(16));
+
+  // thumbmark = 所有组件的联合哈希
+  const thumbData = [machineIdHash, ...macHashes, osUserHash, hostnameHash, gitEmailHash, plat.platform, release, cpu, String(cpuCount), String(memGiB)].join('|');
+  const thumbmark = sha256(thumbData);
+
+  return {
+    thumbmark,
+    components: {
+      machineIdHash,
+      macHashes,
+      osUserHash,
+      hostnameHash,
+      gitEmailHash,
+      platform: plat.platform,
+      arch: plat.arch,
+      osRelease: release,
+      cpuModel: cpu,
+      cpuCount,
+      memGiB,
+      isContainer: false,
+      timezone: tz,
+      runtime: 'cli',
+      collectorVersion: 1,
+    },
+  };
+}
+
+// 启动时确保 config.json 有 fingerprint
+(function ensureFingerprint() {
+  if (!CFG.fingerprint) {
+    CFG.fingerprint = generateFingerprint();
+    try {
+      const configPath = resolve(__dirname, 'config.json');
+      const raw = JSON.parse(readFileSync(configPath, 'utf-8'));
+      raw.fingerprint = CFG.fingerprint;
+      writeFileSync(configPath, JSON.stringify(raw, null, 2) + '\n', 'utf-8');
+      log('info', 'Fingerprint generated and saved to config.json');
+    } catch (e) {
+      log('warn', 'Failed to save fingerprint to config.json', { error: e.message });
+    }
+  }
+})();
+
 let CC_VERSION = '0.32.3';
 const CC_VERSION_FALLBACK = '0.32.3';
 const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h — npm registry 刷新间隔
@@ -137,6 +222,58 @@ function getSessionId(incomingHeaders, apiKey) {
 
 // 每个请求独立 thread ID
 function newThreadId() { return randomUUID(); }
+
+// ── 首次初始化预请求（fingerprint + lifecycle，全局一次） ────
+let proxyInitialized = false;
+
+async function ensureInitialized(apiKey, signal) {
+  if (proxyInitialized) return;
+  proxyInitialized = true;
+
+  try {
+    // 并行发两个预请求
+    const headers = {
+      'Content-Type': 'application/json',
+      'x-cli-environment': 'production',
+      'Authorization': `Bearer ${apiKey}`,
+      'x-command-code-version': CC_VERSION,
+    };
+    const fingerprint = CFG.fingerprint || {};
+
+    await Promise.all([
+      fetch(`${CFG.apiBase}/alpha/fingerprint/record`, {
+        method: 'POST', headers, signal,
+        body: JSON.stringify(fingerprint),
+      }).then(r => {
+        if (!r.ok) log('warn', 'Fingerprint record failed', { status: r.status });
+        else log('info', 'Fingerprint recorded');
+      }).catch(e => {
+        if (e.name !== 'AbortError') log('warn', 'Fingerprint record error', { error: e.message });
+      }),
+
+      fetch(`${CFG.apiBase}/alpha/lifecycle-events`, {
+        method: 'POST', headers, signal,
+        body: JSON.stringify({
+          eventType: 'cli_session_exists',
+          metadata: {
+            sessionId: `sess_${crypto.randomBytes(8).toString('hex')}`,
+            cliVersion: CC_VERSION,
+            mode: 'interactive',
+            os: `${process.platform}-${process.arch}`,
+          },
+        }),
+      }).then(r => {
+        if (!r.ok) log('warn', 'Lifecycle event failed', { status: r.status });
+        else log('info', 'Lifecycle event sent');
+      }).catch(e => {
+        if (e.name !== 'AbortError') log('warn', 'Lifecycle event error', { error: e.message });
+      }),
+    ]);
+  } catch (e) {
+    if (e.name !== 'AbortError') log('warn', 'Initialization error', { error: e.message });
+    proxyInitialized = false; // 失败重试
+  }
+}
 
 // ── 模型列表 ───────────────────────────────────────
 const MODELS = [
@@ -652,6 +789,8 @@ async function handleChatCompletions(req, res) {
   let aborted = false;
 
   try {
+    // 首次初始化（fingerprint + lifecycle）
+    await ensureInitialized(apiKey, abortController.signal);
     // 转发到 CC API（传入客户端 headers，用于提取 session ID）
     const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
 
@@ -1354,6 +1493,8 @@ async function handleMessages(req, res) {
 
   try {
     let reader = null;
+    // 首次初始化（fingerprint + lifecycle）
+    await ensureInitialized(apiKey, abortController.signal);
     const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
 
     if (!ccResponse.ok) {
