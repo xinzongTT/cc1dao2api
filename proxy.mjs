@@ -5,7 +5,7 @@
 import http from 'http';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
-import { readFileSync, writeFileSync, existsSync, appendFileSync } from 'fs';
+import { readFileSync, existsSync, appendFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -118,22 +118,6 @@ function generateFingerprint() {
   };
 }
 
-// 启动时确保 config.json 有 fingerprint
-(function ensureFingerprint() {
-  if (!CFG.fingerprint) {
-    CFG.fingerprint = generateFingerprint();
-    try {
-      const configPath = resolve(__dirname, 'config.json');
-      const raw = JSON.parse(readFileSync(configPath, 'utf-8'));
-      raw.fingerprint = CFG.fingerprint;
-      writeFileSync(configPath, JSON.stringify(raw, null, 2) + '\n', 'utf-8');
-      log('info', 'Fingerprint generated and saved to config.json');
-    } catch (e) {
-      log('warn', 'Failed to save fingerprint to config.json', { error: e.message });
-    }
-  }
-})();
-
 let CC_VERSION = '0.32.3';
 const CC_VERSION_FALLBACK = '0.32.3';
 const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h — npm registry 刷新间隔
@@ -197,13 +181,14 @@ function ensureSession(apiKey) {
   return sessionId;
 }
 
-// 定期清理过期 session，防止 Map 无限增长
+// 定期清理过期 session 和 key 状态，防止 Map 无限增长
 setInterval(() => {
   const now = Date.now();
   let cleaned = 0;
   for (const [key, entry] of sessionStore) {
     if (now >= entry.expiresAt) {
       sessionStore.delete(key);
+      keyStateStore.delete(key); // 同时清理该 key 的指纹状态
       cleaned++;
     }
   }
@@ -226,14 +211,31 @@ function getSessionId(incomingHeaders, apiKey) {
 // 每个请求独立 thread ID
 function newThreadId() { return randomUUID(); }
 
+// ── 每 Key 独立状态（fingerprint + 初始化节流） ──
+// 每个 API Key 拥有自己的设备指纹和初始化定时器
+const keyStateStore = new Map(); // apiKey → { fingerprint, nextInitAt }
+
+function getOrCreateKeyState(apiKey) {
+  let state = keyStateStore.get(apiKey);
+  if (!state) {
+    state = {
+      fingerprint: generateFingerprint(),
+      nextInitAt: 0,
+    };
+    keyStateStore.set(apiKey, state);
+    log('info', 'Fingerprint generated for key', { keyPrefix: apiKey.slice(0, 8) });
+  }
+  return state;
+}
+
 // ── 初始化预请求（fingerprint + lifecycle，首次 + 每 8h+2h 抖动） ────
 const INIT_REFRESH_MS = 8 * 60 * 60 * 1000;    // 8h
 const INIT_JITTER_MS  = 2 * 60 * 60 * 1000;    // 2h 抖动
-let nextInitAt = 0;
 
 async function ensureInitialized(apiKey, signal) {
+  const state = getOrCreateKeyState(apiKey);
   const now = Date.now();
-  if (now < nextInitAt) return;
+  if (now < state.nextInitAt) return;
 
   try {
     // 并行发两个预请求
@@ -243,7 +245,7 @@ async function ensureInitialized(apiKey, signal) {
       'Authorization': `Bearer ${apiKey}`,
       'x-command-code-version': CC_VERSION,
     };
-    const fingerprint = CFG.fingerprint || {};
+    const fingerprint = state.fingerprint || {};
 
     await Promise.all([
       fetch(`${CFG.apiBase}/alpha/fingerprint/record`, {
@@ -264,7 +266,7 @@ async function ensureInitialized(apiKey, signal) {
             sessionId: `sess_${crypto.randomBytes(8).toString('hex')}`,
             cliVersion: CC_VERSION,
             mode: 'interactive',
-            os: `${CFG.fingerprint.components.platform}-${CFG.fingerprint.components.arch}`,
+            os: `${fingerprint.components.platform}-${fingerprint.components.arch}`,
           },
         }),
       }).then(r => {
@@ -277,7 +279,7 @@ async function ensureInitialized(apiKey, signal) {
 
     // 成功：8h + 2h 随机抖动
     const jitter = Math.floor(Math.random() * INIT_JITTER_MS);
-    nextInitAt = Date.now() + INIT_REFRESH_MS + jitter;
+    state.nextInitAt = Date.now() + INIT_REFRESH_MS + jitter;
     log('info', 'Fingerprint/lifecycle next refresh', { nextIn: `${(INIT_REFRESH_MS + jitter) / 3600000}h` });
   } catch (e) {
     if (e.name !== 'AbortError') log('warn', 'Fingerprint/lifecycle refresh error, will retry next request', { error: e.message });
@@ -474,18 +476,11 @@ function buildCcRequest(openaiReq) {
     body.params.reasoning_effort = reasoning_effort;
   }
   if (tools && tools.length > 0) {
-    // body.params.tools = tools.map(t => ({
-    //   type: t.type || 'function',
-    //   name: t.function?.name || t.name,
-    //   description: t.function?.description || t.description || '',
-    //   input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
-    // }));
-    // 2026-06-23: 去掉 description / input_schema 减小请求体，疑似导致上下文异常增长
     body.params.tools = tools.map(t => ({
       type: t.type || 'function',
-      name: t.function?.name || t.name,
-      description: '',
-      input_schema: { type: 'object', properties: {} },
+      name: t.function?.name || t.name || '',
+      description: t.function?.description || t.description || '',
+      input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
     }));
   }
   if (tool_choice !== undefined) {
@@ -820,12 +815,27 @@ async function handleChatCompletions(req, res) {
 
     let reader = null;
     let translator = null;
-    const startTime = Date.now(); let bytesReceived = 0; let lastCcEvent = '';
+    const startTime = Date.now(); let bytesReceived = 0; let lastCcEvent = ''; let keepaliveCount = 0;
 
     // 下游断连检测：打断 CC 上游 + 记录日志
     res.on('close', () => {
       if (res.writableEnded) return; // Normal completion, not a disconnect
       aborted = true;
+      const reason = lastCcEvent?.startsWith('tool-input') ? 'tool-input-silent-timeout'
+        : lastCcEvent?.includes('delta') ? 'streaming-active-disconnect'
+        : 'client-hangup';
+      abortController.signal.aborted || log('warn', 'Client disconnected', {
+        path: '/v1/chat/completions',
+        model, completionId, reason,
+        streaming: stream,
+        elapsedMs: Date.now() - startTime,
+        bytesSent: bytesReceived,
+        lastCcEvent: lastCcEvent || '(none)',
+        keepaliveCount,
+        inputTokens: translator?.inputTokens ?? 0,
+        outputTokens: translator?.outputTokens ?? 0,
+        cachedInputTokens: translator?.cachedInputTokens ?? 0,
+      });
       if (!abortController.signal.aborted) {
         // 断连前抢发 usage=0 终止 chunk，避免下游自行估算 token
         try {
@@ -841,18 +851,6 @@ async function handleChatCompletions(req, res) {
         } catch {}
         try { abortController.abort(); } catch {}
       }
-      log('warn', 'Client disconnected', {
-        path: '/v1/chat/completions',
-        model,
-        completionId,
-        streaming: stream,
-        elapsedMs: Date.now() - startTime,
-        bytesSent: bytesReceived,
-        lastCcEvent: lastCcEvent || '(none)',
-        inputTokens: translator?.inputTokens ?? 0,
-        outputTokens: translator?.outputTokens ?? 0,
-        cachedInputTokens: translator?.cachedInputTokens ?? 0,
-      });
     });
 
     if (stream) {
@@ -880,6 +878,7 @@ async function handleChatCompletions(req, res) {
           const lines = buffer.split('\n');
           buffer = lines.pop() || '';
 
+          let hadOutput = false;
           for (const line of lines) {
             const events = translator.parseLine(line);
             if (events) {
@@ -893,9 +892,12 @@ async function handleChatCompletions(req, res) {
                 started = true;
               }
               for (const evt of events) res.write(evt);
+              hadOutput = true;
             }
             if (translator.lastCcEvent) lastCcEvent = translator.lastCcEvent;
           }
+          // silent events 期间发 keepalive，防止客户端超时断开
+          if (started && !hadOutput) { try { res.write(': keepalive\n\n'); keepaliveCount++; } catch {} }
         }
 
         if (!aborted) {
@@ -1361,6 +1363,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
 
+      let hadOutput = false;
       for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed || trimmed === '[DONE]') continue;
@@ -1380,11 +1383,10 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
 
           case 'text-delta': {
             const text = event.text || '';
-            if (!text) break;
             const startBlock = startTextBlock();
-            if (startBlock) yield startBlock;
-            yield `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'text_delta', text } })}\n\n`;
-            outputTokens += Math.ceil(text.length / 4);
+            yield startBlock + `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: currentBlockIndex, delta: { type: 'text_delta', text } })}\n\n`;
+            outputTokens += 1;
+            hadOutput = true;
             break;
           }
 
@@ -1845,9 +1847,9 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
-      handleChatCompletions(req, res);
+      await handleChatCompletions(req, res);
     } else if (url.pathname === '/v1/messages' && req.method === 'POST') {
-      handleMessages(req, res);
+      await handleMessages(req, res);
     } else if (url.pathname === '/v1/models' && req.method === 'GET') {
       await handleModels(req, res);
     } else if (url.pathname === '/health' || url.pathname === '/') {
@@ -1857,6 +1859,16 @@ const server = http.createServer(async (req, res) => {
     }
   } catch (e) {
     sendJSON(res, 500, { error: { message: e.message, type: 'internal_error' } });
+  }
+});
+
+// 全局兜底：abort 触发的异步 rejection 不会让进程崩溃
+process.on('unhandledRejection', (reason) => {
+  if (reason?.name === 'AbortError' || reason?.code === 'ABORT_ERR') {
+    // 客户端断连触发的 abort — 预期行为，静默处理
+    log('info', 'Aborted request cleaned up');
+  } else {
+    log('error', 'Unhandled rejection', { message: reason?.message || String(reason), stack: reason?.stack?.split('\n')[0] });
   }
 });
 
