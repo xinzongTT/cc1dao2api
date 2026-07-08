@@ -217,6 +217,7 @@ Examples:
 - `model_refresh_interval_ms`
 - `quota_provider_mode`
 - `default_reservation_tokens`
+- `default_input_reservation_tokens`
 - `max_reservation_tokens`
 
 Sensitive values should stay in environment variables.
@@ -366,9 +367,11 @@ Token limit accounting:
 - Preflight uses settled period usage plus active reservations.
 - Limit calculation and reservation insert must be atomic, using `BEGIN IMMEDIATE` or equivalent write-lock behavior so concurrent requests cannot all pass the same preflight check.
 - If no upstream route/decrypt/upstream call starts after reservation, release or roll back the reservation before returning.
-- Reservation budget uses the request's `max_tokens` plus an input-token estimate when possible.
-- If `max_tokens` is missing or input estimation is unavailable, use `default_reservation_tokens`.
+- Reservation budget covers at least requested output capacity plus input capacity.
+- Output reserve uses the request's `max_tokens` when present; if missing, use `default_reservation_tokens`.
+- Input reserve uses an input-token estimate when available; if estimation is unavailable, use `default_input_reservation_tokens`.
 - `default_reservation_tokens` defaults to `8192`.
+- `default_input_reservation_tokens` defaults to `4096`.
 - `max_reservation_tokens` defaults to `200000`; calculated reservations are clamped to this value.
 - If the reservation budget exceeds remaining adjusted quota, reject with an OpenAI/Anthropic-compatible 429 before calling upstream.
 - Streaming requests reserve before the upstream call and settle when the final usage event is parsed.
