@@ -6,6 +6,8 @@ import { registerAuthRoutes } from './admin/routes/auth.mjs';
 import { registerUpstreamKeyRoutes } from './admin/routes/upstreamKeys.mjs';
 import { registerProxyKeyRoutes } from './admin/routes/proxyKeys.mjs';
 import { registerUsageRoutes } from './admin/routes/usage.mjs';
+import { registerDashboardRoutes } from './admin/routes/dashboard.mjs';
+import { registerSettingsRoutes } from './admin/routes/settings.mjs';
 import { createRelayProxyHandlers } from './proxy/relay.mjs';
 
 export function createApp(overrides = {}) {
@@ -27,6 +29,8 @@ export function createApp(overrides = {}) {
   registerUpstreamKeyRoutes(router, ctx);
   registerProxyKeyRoutes(router, ctx);
   registerUsageRoutes(router, ctx);
+  registerDashboardRoutes(router, ctx);
+  registerSettingsRoutes(router, ctx);
 
   return { config, router, ctx, db: ctx.db };
 }
