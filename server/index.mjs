@@ -6,6 +6,7 @@ import { registerAuthRoutes } from './admin/routes/auth.mjs';
 import { registerUpstreamKeyRoutes } from './admin/routes/upstreamKeys.mjs';
 import { registerProxyKeyRoutes } from './admin/routes/proxyKeys.mjs';
 import { registerUsageRoutes } from './admin/routes/usage.mjs';
+import { createRelayProxyHandlers } from './proxy/relay.mjs';
 
 export function createApp(overrides = {}) {
   const config = { ...loadConfig(), ...overrides };
@@ -16,6 +17,11 @@ export function createApp(overrides = {}) {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('OK');
   });
+
+  const proxy = createRelayProxyHandlers(ctx);
+  router.add('POST', '/v1/chat/completions', proxy.handleChatCompletions);
+  router.add('POST', '/v1/messages', proxy.handleMessages);
+  router.add('GET', '/v1/models', proxy.handleModels);
 
   registerAuthRoutes(router, ctx);
   registerUpstreamKeyRoutes(router, ctx);

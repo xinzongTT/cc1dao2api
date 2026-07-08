@@ -39,6 +39,28 @@ export async function adminRequest(app, method, url, body = null, headers = {}) 
   });
 }
 
+export async function addEncryptedUpstreamKey(app, key = 'user_upstream_fixture') {
+  const created = await adminRequest(app, 'POST', '/admin/api/upstream-keys', {
+    name: `upstream-${Date.now()}`,
+    key,
+  });
+  return created.body.key.id;
+}
+
+export async function createRelayKey(app, input = {}) {
+  const created = await adminRequest(app, 'POST', '/admin/api/proxy-keys', {
+    name: input.name || `relay-${Date.now()}`,
+    dailyTokenLimit: input.dailyTokenLimit ?? 100000,
+    monthlyTokenLimit: input.monthlyTokenLimit ?? 1000000,
+    allowedModels: input.allowedModels || [],
+  });
+  return { ...created.body.key, plaintextKey: created.body.plaintextKey };
+}
+
+export function usageTotal(db, proxyKeyId) {
+  return db.prepare('select coalesce(sum(total_tokens), 0) as total from usage_daily where proxy_key_id = ?').get(proxyKeyId).total;
+}
+
 export async function request(app, method, url, body = null, headers = {}) {
   const payload = body == null ? [] : [Buffer.from(JSON.stringify(body))];
   const req = Readable.from(payload);
