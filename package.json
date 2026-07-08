@@ -4,7 +4,7 @@
   "type": "module",
   "description": "Command Code → OpenAI 兼容代理",
   "license": "MIT",
-  "main": "proxy.mjs",
+  "main": "server/index.mjs",
   "scripts": {
     "start": "node server/index.mjs",
     "dev": "node --watch server/index.mjs",

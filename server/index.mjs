@@ -43,10 +43,15 @@ export function createApp(overrides = {}) {
   return { config, router, ctx, db: ctx.db };
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-  const { config, router } = createApp();
+export function startServer(overrides = {}) {
+  const { config, router } = createApp(overrides);
   const server = http.createServer((req, res) => router.handle(req, res));
   server.listen(config.port, config.host, () => {
     console.log(`[info] CC Proxy started http://${config.host}:${config.port}`);
   });
+  return server;
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  startServer();
 }

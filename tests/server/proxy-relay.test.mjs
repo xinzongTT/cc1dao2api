@@ -17,6 +17,16 @@ function fakeZeroOutputCcResponse() {
   return fakeCcSseResponse({ inputTokens: 10, outputTokens: 0, cachedInputTokens: 0 });
 }
 
+function fakeCcNdjsonResponse() {
+  return new Response([
+    '{"type":"text-delta","text":"hello"}\n',
+    '{"type":"finish","totalUsage":{"inputTokens":11,"outputTokens":22,"cachedInputTokens":5}}\n',
+  ].join(''), {
+    status: 200,
+    headers: { 'content-type': 'application/x-ndjson' },
+  });
+}
+
 function validBody() {
   return {
     model: 'deepseek/deepseek-v4-flash',
@@ -54,5 +64,16 @@ describe('relay proxy flow', () => {
     });
     expect(res.status).toBe(429);
     expect(getUpstreamKey(app.db, upstreamId).health_status).toBe('unknown');
+  });
+
+  it('parses real CommandCode ndjson usage events', async () => {
+    const app = await createInitializedApp({ fetch: async () => fakeCcNdjsonResponse() });
+    await addEncryptedUpstreamKey(app, 'user_upstream_ndjson');
+    const relay = await createRelayKey(app, { dailyTokenLimit: 1000 });
+    const res = await request(app, 'POST', '/v1/chat/completions', validBody(), {
+      Authorization: `Bearer ${relay.plaintextKey}`,
+    });
+    expect(res.status).toBe(200);
+    expect(usageTotal(app.db, relay.id)).toBe(33);
   });
 });

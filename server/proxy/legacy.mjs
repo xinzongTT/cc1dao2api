@@ -35,19 +35,24 @@ function usageFromAny(raw = {}) {
   };
 }
 
-function parseSseText(text) {
+function parseCcText(text) {
   let content = '';
   let usage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
 
   for (const line of text.split(/\r?\n/)) {
-    if (!line.startsWith('data:')) continue;
-    const data = line.slice(5).trim();
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith(':')) continue;
+    const data = trimmed.startsWith('data:') ? trimmed.slice(5).trim() : trimmed;
     if (!data || data === '[DONE]') continue;
     try {
       const event = JSON.parse(data);
-      if (typeof event.text === 'string') content += event.text;
+      if (event.type === 'text-delta' && typeof event.text === 'string') content += event.text;
+      if (typeof event.text === 'string' && !event.type) content += event.text;
+      if (typeof event.delta === 'string') content += event.delta;
       if (typeof event.delta?.content === 'string') content += event.delta.content;
       if (typeof event.choices?.[0]?.delta?.content === 'string') content += event.choices[0].delta.content;
+      if (typeof event.choices?.[0]?.message?.content === 'string') content += event.choices[0].message.content;
+      if (event.totalUsage) usage = usageFromAny(event.totalUsage);
       if (event.usage) usage = usageFromAny(event.usage);
     } catch {
       // Ignore malformed upstream event lines; the caller still gets any parsed usage.
@@ -69,7 +74,7 @@ async function parseUpstreamResponse(response) {
       };
     }
   }
-  return parseSseText(text);
+  return parseCcText(text);
 }
 
 function openAiError(message, type = 'invalid_request_error') {
