@@ -107,10 +107,11 @@ Fields:
 
 - `id`
 - `name`
-- `encrypted_key`
+- `encrypted_key_envelope`
 - `key_fingerprint`
-- `status`
-- `last_quota_status`
+- `admin_enabled`
+- `health_status`
+- `quota_status`
 - `quota_total_tokens`
 - `quota_used_tokens`
 - `quota_remaining_tokens`
@@ -119,12 +120,19 @@ Fields:
 - `last_success_at`
 - `last_error_at`
 - `last_error_message`
-- `round_robin_cursor`
 - `notes`
 - `created_at`
 - `updated_at`
 
 The UI never receives plaintext upstream keys. It displays masked values such as `user_abcd...wxyz`.
+
+Status fields are deliberately split:
+
+- `admin_enabled`: manual routing switch controlled by the admin.
+- `health_status`: runtime health state, one of `healthy`, `invalid`, `limited`, `degraded`, `unknown`.
+- `quota_status`: quota refresh state, one of `success`, `failed`, `unknown`, `stale`.
+
+Manual disablement must not erase `health_status` or `quota_status`; re-enabling restores the key to routing only if health allows it.
 
 ### `proxy_keys`
 
@@ -145,7 +153,15 @@ Fields:
 - `created_at`
 - `updated_at`
 
-Plaintext `sk-ccp_...` keys are shown only once when created. SQLite stores only hashes.
+Plaintext `sk-ccp_...` keys are shown only once when created. SQLite stores only HMAC hashes.
+
+Relay key requirements:
+
+- Format: `sk-ccp_` plus at least 32 bytes of cryptographically random entropy encoded URL-safely.
+- `key_hash`: `HMAC-SHA256(RELAY_KEY_PEPPER, plaintext_key)`.
+- `RELAY_KEY_PEPPER` is an environment secret. If absent, derive it from `ENCRYPTION_KEY` with a distinct HKDF context.
+- Compare hashes with constant-time comparison.
+- `key_prefix` is for display and lookup hints only, never for authentication.
 
 ### `usage_events_recent`
 
@@ -203,15 +219,88 @@ Examples:
 
 Sensitive values should stay in environment variables.
 
+### `routing_state`
+
+Stores global routing cursors.
+
+Fields:
+
+- `name`
+- `cursor_value`
+- `updated_at`
+
+For version 1, use `name = 'upstream_round_robin'`. Selecting an upstream key and incrementing this cursor must happen in a single SQLite transaction to keep round-robin behavior stable under concurrent requests.
+
+### `usage_reservations`
+
+Tracks in-flight relay-key token reservations.
+
+Fields:
+
+- `request_id`
+- `proxy_key_id`
+- `reserved_tokens`
+- `settled_tokens`
+- `status`
+- `created_at`
+- `settled_at`
+
+Statuses:
+
+- `reserved`
+- `settled`
+- `released`
+- `expired`
+
+Reservations protect daily/monthly token limits from concurrent streaming requests that finish later with final usage.
+
+### `usage_adjustments`
+
+Tracks admin-initiated usage resets without destroying historical aggregates.
+
+Fields:
+
+- `id`
+- `proxy_key_id`
+- `period_type`
+- `period_start`
+- `offset_tokens`
+- `reason`
+- `created_at`
+
+Resetting current period usage creates an adjustment/offset. It must not delete `usage_hourly` or `usage_daily` rows.
+
+### Indexes and Constraints
+
+Required constraints:
+
+- Unique `admin_users.username`.
+- Unique `upstream_keys.key_fingerprint`.
+- Unique `proxy_keys.key_hash`.
+- Composite unique bucket key on `usage_hourly` and `usage_daily`.
+
+Required indexes:
+
+- `usage_events_recent.created_at`.
+- `usage_events_recent.proxy_key_id`.
+- `usage_events_recent.upstream_key_id`.
+- `usage_hourly.bucket_start`.
+- `usage_daily.bucket_start`.
+- `usage_reservations.proxy_key_id, status`.
+
 ## Key Security
 
 Upstream `user_...` keys:
 
 - Must be encrypted at rest.
 - Use `ENCRYPTION_KEY` from the environment.
-- Encrypt with AES-GCM.
-- Store ciphertext, IV, auth tag, and a non-sensitive fingerprint.
+- Encrypt with AES-256-GCM.
+- Store a versioned envelope in `encrypted_key_envelope`, formatted as `enc:v1:<key_id>:<iv_b64url>:<tag_b64url>:<ciphertext_b64url>`.
+- `ENCRYPTION_KEY` must decode to exactly 32 random bytes from base64url or base64. Other formats are invalid.
+- `key_id` defaults to `default` in version 1 and exists to allow later key rotation.
+- Store a non-sensitive fingerprint for deduplication and display.
 - Decrypt only in memory for the active upstream request.
+- If `ENCRYPTION_KEY` is missing or invalid, the service may still start for read-only inspection, but adding or decrypting upstream keys must fail clearly and proxy routing must report no decryptable upstream keys.
 
 Downstream `sk-ccp_...` keys:
 
@@ -225,6 +314,11 @@ Admin sessions:
 - Use secure cookie sessions.
 - Cookies must be `HttpOnly` and `SameSite=Lax`.
 - Enable `Secure` when configured for HTTPS.
+- Passwords use a memory-hard hash such as Node `crypto.scrypt` or Argon2id. If only built-in dependencies are preferred, use `scrypt` with per-user salt.
+- Login success rotates the session identifier.
+- Login failures are rate-limited by username and client IP.
+- Mutating admin routes must validate either a CSRF token or strict `Origin`/`Host` checks.
+- Session signing secret must come from a stable environment secret or be generated once and stored locally; it must not change on every restart.
 
 Logging:
 
@@ -244,15 +338,29 @@ Flow:
 1. Parse and hash the relay key.
 2. Look up `proxy_keys`.
 3. Reject disabled or unknown relay keys.
-4. Check daily/monthly token limits.
-5. Check `allowed_models_json` if configured.
-6. Select an enabled and healthy upstream key using round-robin.
-7. Decrypt the upstream `user_...` key for this request only.
-8. Reuse the current OpenAI/Anthropic compatibility pipeline.
-9. Forward to Command Code with the selected upstream key.
-10. Return OpenAI/Anthropic-compatible responses.
-11. Record a recent event and update hourly/daily aggregates.
-12. Update upstream health status based on the result.
+4. Check `allowed_models_json` if configured.
+5. Estimate a reservation budget for token limit enforcement.
+6. Check daily/monthly token limits including settled usage plus active reservations.
+7. Create a `usage_reservations` row in a transaction.
+8. Select an enabled and healthy upstream key using round-robin in a transaction.
+9. Decrypt the upstream `user_...` key for this request only.
+10. Reuse the current OpenAI/Anthropic compatibility pipeline.
+11. Forward to Command Code with the selected upstream key.
+12. Return OpenAI/Anthropic-compatible responses.
+13. Settle or release the reservation based on final usage and outcome.
+14. Record a recent event and update hourly/daily aggregates.
+15. Update upstream health status based on the original upstream result.
+
+Token limit accounting:
+
+- Preflight uses settled period usage plus active reservations.
+- Reservation budget should use the request's `max_tokens` plus an input-token estimate when possible; if input estimation is not available, use a conservative configurable reserve cap.
+- Streaming requests reserve before the upstream call and settle when the final usage event is parsed.
+- Non-streaming requests reserve before the upstream call and settle after the response usage is known.
+- If the upstream call fails before usage is known, release the reservation and record an error event with zero settled tokens unless upstream usage was captured.
+- If the client disconnects before final usage, settle with captured usage if available; otherwise expire/release the reservation and record the disconnect.
+- A periodic cleanup job marks old `reserved` rows as `expired` so crashed requests do not permanently consume quota.
+- Usage reset actions apply `usage_adjustments` offsets and must be considered in limit calculations.
 
 Routing:
 
@@ -266,23 +374,34 @@ Compatibility option:
 - `allowDirectUserKey=false` by default.
 - If enabled, old clients may still pass `user_...` directly.
 - Direct upstream-key requests are not controlled by relay-key quotas.
+- Direct mode requests are still recorded with `proxy_key_id = null`.
+- Admin UI must label these rows as direct upstream usage so dashboard totals explain quota bypasses clearly.
 
 ## Upstream Key Selection
 
 Use round-robin for version 1:
 
-- Only select `enabled` and healthy upstream keys.
-- Rotate evenly across available keys.
+- Only select keys with `admin_enabled = true` and routeable `health_status`.
+- Rotate evenly across available keys using `routing_state.name = 'upstream_round_robin'`.
+- The key selection query and cursor update must be atomic in SQLite.
 - Do not implement weighted routing in version 1.
 - Do not implement automatic multi-key retry for streaming responses in version 1, because duplicate upstream calls can create inconsistent token accounting and duplicated generation.
 
 Status handling:
 
-- `invalid`: set when upstream returns authentication failure such as 401; exclude from routing.
-- `limited`: set when upstream returns quota/rate-limit-like errors such as 402 or 429; exclude until manual recovery or successful refresh/test.
-- `degraded`: set after repeated 5xx/network failures; deprioritize or exclude based on implementation threshold.
-- `enabled`: available for routing.
-- `disabled`: manually disabled by admin.
+- `healthy`: available for routing when `admin_enabled = true`.
+- `unknown`: available for routing when `admin_enabled = true`; this is the default before first test/traffic result.
+- `invalid`: set when the original upstream response returns authentication failure such as 401; exclude from routing.
+- `limited`: set when the original upstream response returns quota/rate-limit-like errors such as 402 or true upstream 429; exclude until manual recovery or successful refresh/test.
+- `degraded`: set after repeated original upstream 5xx/network failures; exclude from routing until manual recovery or successful test.
+- Internal proxy compatibility errors such as zero-output 429, stream idle timeout 429, or client disconnect must not mark an upstream key as `limited` unless the original upstream response proves it.
+- `admin_enabled = false` manually removes a key from routing without changing `health_status`.
+
+Session mapping:
+
+- Existing per-key Command Code session/fingerprint behavior should be keyed by `upstream_key_id`.
+- Client-provided session headers may still be honored only after validation, but they must not let one downstream relay key force session identity for unrelated upstream keys.
+- If the implementation preserves client session override, recent diagnostics should record that override was used without logging the raw session header.
 
 ## Quota Refresh
 
@@ -317,6 +436,17 @@ Use React + Vite. The design direction follows `ui-ux-pro-max` recommendations f
 - Loading states for async operations.
 - Field-level validation errors.
 - Responsive behavior for 375px, 768px, 1024px, and 1440px widths.
+
+Visual/product constraints:
+
+- Use a persistent left sidebar on desktop and a compact top/mobile navigation on small screens.
+- Prioritize dense tables and scannable KPI rows over marketing-style hero sections.
+- Do not nest cards inside cards.
+- Use semantic status colors consistently: success/healthy, warning/stale, danger/invalid, neutral/unknown.
+- Provide empty states for no upstream keys, no relay keys, no usage, and quota unknown.
+- Destructive actions use confirmation dialogs and are visually separated from normal row actions.
+- Numeric tables use tabular figures to prevent layout shift.
+- Charts must include visible numeric summaries; color must not be the only signal.
 
 Pages:
 
@@ -437,7 +567,14 @@ Sensitive values must not be displayed.
 
 ## Admin API
 
-All admin routes require authenticated admin session.
+Admin routes require authenticated admin session except the initialization route.
+
+Initialization rule:
+
+- `POST /admin/api/auth/init` is anonymous only while `admin_users` is empty.
+- The handler must check emptiness and insert the first admin in a single transaction.
+- Once an admin exists, it returns `409` and cannot overwrite the existing admin.
+- The created admin's `created_at` records initialization time.
 
 Suggested route groups:
 
@@ -457,8 +594,26 @@ Suggested route groups:
 - `PATCH /admin/api/proxy-keys/:id`
 - `DELETE /admin/api/proxy-keys/:id`
 - `GET /admin/api/usage`
+- `GET /admin/api/usage/export`
 - `GET /admin/api/settings`
 - `PATCH /admin/api/settings`
+
+`GET /admin/api/usage` supports:
+
+- `from`
+- `to`
+- `bucket=hour|day`
+- `group_by=proxy_key|upstream_key|model|endpoint`
+- `proxy_key_id`
+- `upstream_key_id`
+- `model`
+- `endpoint`
+- `success`
+- `limit`
+- `offset`
+- `sort`
+
+CSV export uses `GET /admin/api/usage/export` with the same filters and a bounded maximum range/row count.
 
 Admin API error format:
 
@@ -481,9 +636,14 @@ Backend:
 - Startup fails clearly if SQLite migration fails.
 - Adding upstream keys fails clearly if `ENCRYPTION_KEY` is missing.
 - Quota refresh failure stores a visible error and keeps the previous successful snapshot.
-- 401 upstream errors mark keys invalid.
-- 402/429 upstream errors mark keys limited.
-- Repeated 5xx/network errors mark keys degraded.
+- Original upstream 401 errors mark keys invalid.
+- Original upstream 402/429 errors mark keys limited.
+- Proxy-generated compatibility 429 errors do not mark upstream keys limited.
+- Repeated original upstream 5xx/network errors mark keys degraded.
+- Init can only create the first admin and cannot be replayed after an admin exists.
+- Admin mutating routes reject missing/invalid CSRF or Origin/Host validation.
+- Wrong `ENCRYPTION_KEY` fails decryption clearly and does not return corrupted secrets.
+- In-flight token reservations must be settled, released, or expired; they must not remain active forever.
 - Admin API never leaks secret values.
 
 Frontend:
@@ -501,19 +661,31 @@ Backend unit tests:
 - Config loading.
 - Relay key generation and hashing.
 - AES-GCM encryption/decryption.
+- Encryption envelope parsing and wrong-key failure.
 - Missing `ENCRYPTION_KEY` behavior.
 - Round-robin upstream selection.
+- Round-robin cursor update inside a transaction.
 - Relay key daily/monthly quota checks.
+- Usage reservation create/settle/release/expire behavior.
+- Usage reset adjustment behavior.
 - Usage aggregate updates.
 - Quota refresh success/failure state updates.
+- Password hashing and session rotation helpers.
 
 Backend integration tests:
 
+- Admin init succeeds exactly once and then returns 409.
+- Login rate limiting and session restore.
+- Admin mutating routes reject missing CSRF or invalid Origin/Host.
 - `/v1/chat/completions` with valid relay key.
 - `/v1/messages` with valid relay key.
 - `/v1/models` with available upstream key and fallback.
 - Disabled/unknown relay key rejection.
 - Model allowlist rejection.
+- Concurrent requests cannot exceed daily/monthly relay key limits beyond reservation policy.
+- Streaming final usage settles the reservation and updates aggregates.
+- Client disconnect releases or settles reservations according to captured usage.
+- Zero-output and stream-timeout compatibility errors do not mark upstream keys limited unless original upstream status requires it.
 - Usage event and aggregate creation.
 - Upstream error mapping and health marking.
 
@@ -556,7 +728,11 @@ Build/deploy verification:
 - Admin can create multiple downstream `sk-ccp_...` keys with token limits.
 - Clients can call OpenAI/Anthropic-compatible endpoints using relay keys.
 - Requests are distributed across enabled upstream keys by round-robin.
+- Round-robin selection remains stable under concurrent requests.
+- Daily/monthly token limits account for in-flight streaming requests through reservations.
 - Usage is aggregated by hour/day and visible in the dashboard.
 - Quota refresh failures are visible but do not stop proxy traffic.
+- Init cannot overwrite an existing admin.
+- Proxy-generated timeout/zero-output errors do not incorrectly mark upstream keys limited.
 - Secrets are never exposed in API responses, logs, or UI tables.
 - Docker persists SQLite data under `/app/data`.
