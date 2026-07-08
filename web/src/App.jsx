@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import { AppShell } from './components/AppShell.jsx';
 import { AuthPage } from './pages/AuthPage.jsx';
 import { api } from './lib/api.js';
+import { UpstreamKeysPage } from './pages/UpstreamKeysPage.jsx';
+import { RelayKeysPage } from './pages/RelayKeysPage.jsx';
 
 function PlaceholderPage({ title }) {
   return (
@@ -16,11 +18,15 @@ function PlaceholderPage({ title }) {
 
 const titles = {
   dashboard: 'Dashboard',
-  upstream: 'Upstream Keys',
-  relay: 'Relay Keys',
   usage: 'Usage Analytics',
   settings: 'Settings',
 };
+
+function renderPage(page) {
+  if (page === 'upstream') return <UpstreamKeysPage api={api} />;
+  if (page === 'relay') return <RelayKeysPage api={api} />;
+  return <PlaceholderPage title={titles[page]} />;
+}
 
 export function App() {
   const [session, setSession] = useState(null);
@@ -49,7 +55,7 @@ export function App() {
 
   return (
     <AppShell activePage={page} onNavigate={setPage} onLogout={logout}>
-      <PlaceholderPage title={titles[page]} />
+      {renderPage(page)}
     </AppShell>
   );
 }
