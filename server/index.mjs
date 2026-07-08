@@ -5,6 +5,7 @@ import { createAdminContext } from './admin/context.mjs';
 import { registerAuthRoutes } from './admin/routes/auth.mjs';
 import { registerUpstreamKeyRoutes } from './admin/routes/upstreamKeys.mjs';
 import { registerProxyKeyRoutes } from './admin/routes/proxyKeys.mjs';
+import { registerUsageRoutes } from './admin/routes/usage.mjs';
 
 export function createApp(overrides = {}) {
   const config = { ...loadConfig(), ...overrides };
@@ -19,6 +20,7 @@ export function createApp(overrides = {}) {
   registerAuthRoutes(router, ctx);
   registerUpstreamKeyRoutes(router, ctx);
   registerProxyKeyRoutes(router, ctx);
+  registerUsageRoutes(router, ctx);
 
   return { config, router, ctx, db: ctx.db };
 }
