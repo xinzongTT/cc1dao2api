@@ -23,6 +23,22 @@ export async function createInitializedApp(overrides = {}) {
   return app;
 }
 
+export async function loginAsAdmin(app) {
+  const login = await request(app, 'POST', '/admin/api/auth/login', { username: 'admin', password: 'pass123456' });
+  app.__adminCookie = login.cookie;
+  app.__csrfToken = login.body.csrfToken;
+  return login;
+}
+
+export async function adminRequest(app, method, url, body = null, headers = {}) {
+  if (!app.__adminCookie) await loginAsAdmin(app);
+  return request(app, method, url, body, {
+    Cookie: app.__adminCookie,
+    'X-CSRF-Token': app.__csrfToken,
+    ...headers,
+  });
+}
+
 export async function request(app, method, url, body = null, headers = {}) {
   const payload = body == null ? [] : [Buffer.from(JSON.stringify(body))];
   const req = Readable.from(payload);

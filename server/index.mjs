@@ -3,6 +3,8 @@ import { loadConfig } from './config/index.mjs';
 import { createRouter } from './http/router.mjs';
 import { createAdminContext } from './admin/context.mjs';
 import { registerAuthRoutes } from './admin/routes/auth.mjs';
+import { registerUpstreamKeyRoutes } from './admin/routes/upstreamKeys.mjs';
+import { registerProxyKeyRoutes } from './admin/routes/proxyKeys.mjs';
 
 export function createApp(overrides = {}) {
   const config = { ...loadConfig(), ...overrides };
@@ -15,6 +17,8 @@ export function createApp(overrides = {}) {
   });
 
   registerAuthRoutes(router, ctx);
+  registerUpstreamKeyRoutes(router, ctx);
+  registerProxyKeyRoutes(router, ctx);
 
   return { config, router, ctx, db: ctx.db };
 }
