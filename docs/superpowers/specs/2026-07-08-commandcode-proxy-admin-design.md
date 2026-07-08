@@ -216,6 +216,8 @@ Examples:
 - `auto_quota_refresh_enabled`
 - `model_refresh_interval_ms`
 - `quota_provider_mode`
+- `default_reservation_tokens`
+- `max_reservation_tokens`
 
 Sensitive values should stay in environment variables.
 
@@ -269,6 +271,14 @@ Fields:
 - `created_at`
 
 Resetting current period usage creates an adjustment/offset. It must not delete `usage_hourly` or `usage_daily` rows.
+
+Current-period quota displays and limit checks use adjusted usage:
+
+```text
+adjusted_usage = max(0, aggregate_total + sum(usage_adjustments.offset_tokens))
+```
+
+Usage analytics and CSV export default to raw historical aggregates and include adjustment rows or reset markers when the selected range contains resets.
 
 ### Indexes and Constraints
 
@@ -340,8 +350,8 @@ Flow:
 3. Reject disabled or unknown relay keys.
 4. Check `allowed_models_json` if configured.
 5. Estimate a reservation budget for token limit enforcement.
-6. Check daily/monthly token limits including settled usage plus active reservations.
-7. Create a `usage_reservations` row in a transaction.
+6. In one SQLite transaction, check daily/monthly token limits including adjusted settled usage plus active reservations and insert the `usage_reservations` row.
+7. If the transaction cannot reserve capacity, reject the request before selecting an upstream key.
 8. Select an enabled and healthy upstream key using round-robin in a transaction.
 9. Decrypt the upstream `user_...` key for this request only.
 10. Reuse the current OpenAI/Anthropic compatibility pipeline.
@@ -354,12 +364,18 @@ Flow:
 Token limit accounting:
 
 - Preflight uses settled period usage plus active reservations.
-- Reservation budget should use the request's `max_tokens` plus an input-token estimate when possible; if input estimation is not available, use a conservative configurable reserve cap.
+- Limit calculation and reservation insert must be atomic, using `BEGIN IMMEDIATE` or equivalent write-lock behavior so concurrent requests cannot all pass the same preflight check.
+- If no upstream route/decrypt/upstream call starts after reservation, release or roll back the reservation before returning.
+- Reservation budget uses the request's `max_tokens` plus an input-token estimate when possible.
+- If `max_tokens` is missing or input estimation is unavailable, use `default_reservation_tokens`.
+- `default_reservation_tokens` defaults to `8192`.
+- `max_reservation_tokens` defaults to `200000`; calculated reservations are clamped to this value.
+- If the reservation budget exceeds remaining adjusted quota, reject with an OpenAI/Anthropic-compatible 429 before calling upstream.
 - Streaming requests reserve before the upstream call and settle when the final usage event is parsed.
 - Non-streaming requests reserve before the upstream call and settle after the response usage is known.
 - If the upstream call fails before usage is known, release the reservation and record an error event with zero settled tokens unless upstream usage was captured.
-- If the client disconnects before final usage, settle with captured usage if available; otherwise expire/release the reservation and record the disconnect.
-- A periodic cleanup job marks old `reserved` rows as `expired` so crashed requests do not permanently consume quota.
+- If the client disconnects before final usage and the request handler can still update SQLite, settle with captured usage if available; otherwise mark the reservation `released` and record the disconnect.
+- Only the periodic cleanup job marks old `reserved` rows as `expired`; `expired` is for abandoned rows left by process crashes or hard failures.
 - Usage reset actions apply `usage_adjustments` offsets and must be considered in limit calculations.
 
 Routing:
@@ -612,6 +628,17 @@ Suggested route groups:
 - `limit`
 - `offset`
 - `sort`
+
+Allowed `sort` fields:
+
+- `created_at`
+- `bucket_start`
+- `total_tokens`
+- `request_count`
+- `error_count`
+- `avg_duration_ms`
+
+Default sort is `bucket_start desc` for aggregate usage and `created_at desc` for recent diagnostics. Sort fields must be allowlisted before being used in SQL.
 
 CSV export uses `GET /admin/api/usage/export` with the same filters and a bounded maximum range/row count.
 
