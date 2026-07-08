@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config/index.mjs';
 import { createRouter } from './http/router.mjs';
 import { serveStaticOrIndex } from './http/static.mjs';
@@ -52,6 +53,10 @@ export function startServer(overrides = {}) {
   return server;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+export function isDirectRun(metaUrl, argvPath = process.argv[1]) {
+  return Boolean(argvPath) && resolve(fileURLToPath(metaUrl)) === resolve(argvPath);
+}
+
+if (isDirectRun(import.meta.url)) {
   startServer();
 }
