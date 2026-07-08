@@ -9,4 +9,5 @@ stderr.txt
 captured-requests/
 .worktrees/
 dist/
+data/
 
