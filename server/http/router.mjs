@@ -5,6 +5,7 @@ export function sendJson(res, status, payload, headers = {}) {
 
 export function createRouter() {
   const routes = [];
+  let notFoundHandler = null;
   function matchPath(routePath, requestPath) {
     const routeParts = routePath.split('/').filter(Boolean);
     const requestParts = requestPath.split('/').filter(Boolean);
@@ -26,6 +27,9 @@ export function createRouter() {
     add(method, path, handler) {
       routes.push({ method, path, handler });
     },
+    setNotFound(handler) {
+      notFoundHandler = handler;
+    },
     async handle(req, res) {
       const host = req.headers?.host || 'localhost';
       const url = new URL(req.url, `http://${host}`);
@@ -40,6 +44,7 @@ export function createRouter() {
         }
       }
       if (!route) {
+        if (notFoundHandler && await notFoundHandler(req, res, url)) return undefined;
         return sendJson(res, 404, { error: { message: 'Not found', type: 'not_found' } });
       }
       req.params = params;

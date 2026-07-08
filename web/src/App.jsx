@@ -4,6 +4,9 @@ import { AuthPage } from './pages/AuthPage.jsx';
 import { api } from './lib/api.js';
 import { UpstreamKeysPage } from './pages/UpstreamKeysPage.jsx';
 import { RelayKeysPage } from './pages/RelayKeysPage.jsx';
+import { DashboardPage } from './pages/DashboardPage.jsx';
+import { UsagePage } from './pages/UsagePage.jsx';
+import { SettingsPage } from './pages/SettingsPage.jsx';
 
 function PlaceholderPage({ title }) {
   return (
@@ -17,14 +20,14 @@ function PlaceholderPage({ title }) {
 }
 
 const titles = {
-  dashboard: 'Dashboard',
-  usage: 'Usage Analytics',
-  settings: 'Settings',
 };
 
 function renderPage(page) {
+  if (page === 'dashboard') return <DashboardPage api={api} />;
   if (page === 'upstream') return <UpstreamKeysPage api={api} />;
   if (page === 'relay') return <RelayKeysPage api={api} />;
+  if (page === 'usage') return <UsagePage api={api} />;
+  if (page === 'settings') return <SettingsPage api={api} />;
   return <PlaceholderPage title={titles[page]} />;
 }
 

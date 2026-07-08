@@ -1,6 +1,8 @@
 import http from 'node:http';
+import { join, resolve } from 'node:path';
 import { loadConfig } from './config/index.mjs';
 import { createRouter } from './http/router.mjs';
+import { serveStaticOrIndex } from './http/static.mjs';
 import { createAdminContext } from './admin/context.mjs';
 import { registerAuthRoutes } from './admin/routes/auth.mjs';
 import { registerUpstreamKeyRoutes } from './admin/routes/upstreamKeys.mjs';
@@ -31,6 +33,12 @@ export function createApp(overrides = {}) {
   registerUsageRoutes(router, ctx);
   registerDashboardRoutes(router, ctx);
   registerSettingsRoutes(router, ctx);
+  const staticRoot = config.staticRoot || resolve(process.cwd(), 'dist');
+  const staticIndexPath = config.staticIndexPath || join(staticRoot, 'index.html');
+  router.setNotFound((req, res) => serveStaticOrIndex(req, res, {
+    rootDir: staticRoot,
+    indexPath: staticIndexPath,
+  }));
 
   return { config, router, ctx, db: ctx.db };
 }
