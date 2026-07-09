@@ -36,7 +36,7 @@ function fakeSettingsApi(environment) {
 describe('dashboard usage and settings pages', () => {
   it('renders dashboard kpis and token trend', async () => {
     render(<DashboardPage api={fakeDashboardApi()} />);
-    expect(await screen.findByText('今日 Token')).toBeInTheDocument();
+    expect(await screen.findByText('今日令牌')).toBeInTheDocument();
     expect(screen.getByText('可用上游密钥')).toBeInTheDocument();
     expect(screen.getByText('成功')).toBeInTheDocument();
   });

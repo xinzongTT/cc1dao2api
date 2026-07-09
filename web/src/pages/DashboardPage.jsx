@@ -18,7 +18,7 @@ export function DashboardPage({ api }) {
       <div className="section-header"><h1>仪表盘</h1></div>
       <div className="kpi-grid">
         <KpiCard label="总请求数" value={data.kpis.totalRequests.toLocaleString()} />
-        <KpiCard label="今日 Token" value={data.kpis.todayTokens.toLocaleString()} tone="success" />
+        <KpiCard label="今日令牌" value={data.kpis.todayTokens.toLocaleString()} tone="success" />
         <KpiCard label="成功率" value={`${Math.round(data.kpis.successRate * 100)}%`} />
         <KpiCard label="可用上游密钥" value={data.kpis.availableUpstreamKeys} />
         <KpiCard label="额度未知密钥" value={data.kpis.unknownQuotaKeys} tone="warning" />
@@ -29,7 +29,7 @@ export function DashboardPage({ api }) {
         columns={[
           { key: 'name', header: '上游' },
           { key: 'quotaStatus', header: '额度', render: (row) => statusText(row.quotaStatus) },
-          { key: 'remainingTokens', header: '剩余 Token', render: (row) => row.remainingTokens?.toLocaleString?.() || '未知' },
+          { key: 'remainingTokens', header: '剩余令牌', render: (row) => row.remainingTokens?.toLocaleString?.() || '未知' },
         ]}
         rows={data.upstreamQuota || []}
         emptyTitle="暂无上游额度数据"

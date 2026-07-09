@@ -10,4 +10,6 @@ captured-requests/
 .worktrees/
 dist/
 data/
+.local-preview/
+.playwright-cli/
 

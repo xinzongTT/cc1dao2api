@@ -12,14 +12,14 @@ export function UsagePage({ api }) {
     <section className="page-section">
       <div className="section-header">
         <h1>用量分析</h1>
-        <a className="secondary-link" href="/admin/api/usage/export?bucket=day">导出 CSV</a>
+        <a className="secondary-link" href="/admin/api/usage/export?bucket=day">导出数据</a>
       </div>
       <DataTable
         columns={[
           { key: 'bucket_start', header: '时间桶' },
           { key: 'model', header: '模型' },
           { key: 'request_count', header: '请求数', render: (row) => <span className="tabular">{row.request_count}</span> },
-          { key: 'total_tokens', header: 'Token 数', render: (row) => <span className="tabular">{row.total_tokens}</span> },
+          { key: 'total_tokens', header: '令牌数', render: (row) => <span className="tabular">{row.total_tokens}</span> },
         ]}
         rows={rows.map((row, index) => ({ id: `${row.bucket_start}-${row.model}-${index}`, ...row }))}
         emptyTitle="暂无用量记录"

@@ -8,7 +8,7 @@ import { adminErrorMessage } from '../lib/errors.js';
 function quotaText(key) {
   if (key.quotaStatus === 'unknown') return '额度未知';
   if (key.quotaRemainingTokens == null) return statusText(key.quotaStatus);
-  return `${key.quotaRemainingTokens.toLocaleString()} Token 剩余`;
+  return `剩余 ${key.quotaRemainingTokens.toLocaleString()} 令牌`;
 }
 
 export function UpstreamKeysPage({ api }) {
