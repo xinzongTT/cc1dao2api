@@ -27,6 +27,18 @@ function fakeCcNdjsonResponse() {
   });
 }
 
+function fakeReasoningOnlyCcResponse() {
+  return new Response([
+    '{"type":"start"}\n',
+    '{"type":"reasoning-start","id":"reasoning-0"}\n',
+    '{"type":"reasoning-delta","id":"reasoning-0","text":"thinking"}\n',
+    '{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":5,"outputTokens":6,"cachedInputTokens":1}}\n',
+  ].join(''), {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream' },
+  });
+}
+
 function validBody() {
   return {
     model: 'deepseek/deepseek-v4-flash',
@@ -224,6 +236,23 @@ describe('relay proxy flow', () => {
     expect(usageTotal(app.db, relay.id)).toBe(33);
   });
 
+  it('preserves CommandCode reasoning deltas in non-streaming OpenAI responses', async () => {
+    const app = await createInitializedApp({ fetch: async () => fakeReasoningOnlyCcResponse() });
+    await addEncryptedUpstreamKey(app, 'user_upstream_reasoning');
+    const relay = await createRelayKey(app, { dailyTokenLimit: 1000 });
+    const res = await request(app, 'POST', '/v1/chat/completions', validBody(), {
+      Authorization: `Bearer ${relay.plaintextKey}`,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.choices[0].message).toMatchObject({
+      role: 'assistant',
+      content: null,
+      reasoning_content: 'thinking',
+    });
+    expect(usageTotal(app.db, relay.id)).toBe(11);
+  });
+
   it('returns OpenAI-compatible server-sent events for streaming chat completions', async () => {
     const app = await createInitializedApp({
       fetch: async () => fakeCcSseResponse({ inputTokens: 10, outputTokens: 20, cachedInputTokens: 3 }),
@@ -240,6 +269,20 @@ describe('relay proxy flow', () => {
     expect(res.text).toContain('"content":"hello"');
     expect(res.text).toContain('data: [DONE]');
     expect(usageTotal(app.db, relay.id)).toBe(30);
+  });
+
+  it('preserves CommandCode reasoning deltas in streaming OpenAI responses', async () => {
+    const app = await createInitializedApp({ fetch: async () => fakeReasoningOnlyCcResponse() });
+    await addEncryptedUpstreamKey(app, 'user_upstream_reasoning_stream');
+    const relay = await createRelayKey(app, { dailyTokenLimit: 1000 });
+    const res = await request(app, 'POST', '/v1/chat/completions', { ...validBody(), stream: true }, {
+      Authorization: `Bearer ${relay.plaintextKey}`,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.text).toContain('"reasoning_content":"thinking"');
+    expect(res.text).toContain('data: [DONE]');
+    expect(usageTotal(app.db, relay.id)).toBe(11);
   });
 
   it('returns Anthropic-compatible server-sent events for streaming messages', async () => {

@@ -275,6 +275,9 @@ function normalizeUsage(usage) {
 
 function parseCcText(text) {
   let content = '';
+  let reasoningContent = '';
+  let finishReason = 'stop';
+  let toolCalls = null;
   let usage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
 
   for (const line of text.split(/\r?\n/)) {
@@ -285,11 +288,26 @@ function parseCcText(text) {
     try {
       const event = JSON.parse(data);
       if (event.type === 'text-delta' && typeof event.text === 'string') content += event.text;
+      if (event.type === 'reasoning-delta' && typeof event.text === 'string') reasoningContent += event.text;
+      if (event.type === 'tool-call') {
+        toolCalls = toolCalls || [];
+        toolCalls.push({
+          id: event.toolCallId || `call_${randomUUID().slice(0, 8)}`,
+          type: 'function',
+          function: {
+            name: event.toolName || '',
+            arguments: typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {}),
+          },
+        });
+      }
       if (typeof event.text === 'string' && !event.type) content += event.text;
       if (typeof event.delta === 'string') content += event.delta;
       if (typeof event.delta?.content === 'string') content += event.delta.content;
       if (typeof event.choices?.[0]?.delta?.content === 'string') content += event.choices[0].delta.content;
+      if (typeof event.choices?.[0]?.delta?.reasoning_content === 'string') reasoningContent += event.choices[0].delta.reasoning_content;
       if (typeof event.choices?.[0]?.message?.content === 'string') content += event.choices[0].message.content;
+      if (typeof event.choices?.[0]?.message?.reasoning_content === 'string') reasoningContent += event.choices[0].message.reasoning_content;
+      if (event.type === 'finish' && event.finishReason) finishReason = mapFinishReason(event.finishReason);
       if (event.totalUsage) usage = usageFromAny(event.totalUsage);
       if (event.usage) usage = usageFromAny(event.usage);
     } catch {
@@ -297,7 +315,7 @@ function parseCcText(text) {
     }
   }
 
-  return { content, usage };
+  return { content, reasoningContent, toolCalls, finishReason, usage };
 }
 
 async function parseUpstreamResponse(response) {
@@ -308,6 +326,9 @@ async function parseUpstreamResponse(response) {
     if (data.usage) {
       return {
         content: data.choices?.[0]?.message?.content || data.content?.[0]?.text || '',
+        reasoningContent: data.choices?.[0]?.message?.reasoning_content || '',
+        toolCalls: data.choices?.[0]?.message?.tool_calls || null,
+        finishReason: data.choices?.[0]?.finish_reason || 'stop',
         usage: usageFromAny(data.usage),
       };
     }
@@ -317,6 +338,18 @@ async function parseUpstreamResponse(response) {
 
 function openAiError(message, type = 'invalid_request_error') {
   return { error: { message, type } };
+}
+
+function mapFinishReason(reason) {
+  if (reason === 'tool-calls') return 'tool_calls';
+  if (reason === 'length') return 'length';
+  return reason || 'stop';
+}
+
+function mapAnthropicStopReason(reason) {
+  if (reason === 'tool_calls') return 'tool_use';
+  if (reason === 'length') return 'max_tokens';
+  return 'end_turn';
 }
 
 function writeSse(res, event, data) {
@@ -329,9 +362,10 @@ function writeSseDone(res) {
   res.end();
 }
 
-function sendOpenAiStream(res, body, content, usage) {
+function sendOpenAiStream(res, body, parsed) {
   const id = `chatcmpl-${randomUUID().slice(0, 12)}`;
   const model = body.model || 'deepseek/deepseek-v4-flash';
+  const usage = parsed.usage;
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
@@ -344,13 +378,31 @@ function sendOpenAiStream(res, body, content, usage) {
     model,
     choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
   });
-  if (content) {
+  if (parsed.reasoningContent) {
     writeSse(res, null, {
       id,
       object: 'chat.completion.chunk',
       created: nowUnix(),
       model,
-      choices: [{ index: 0, delta: { content }, finish_reason: null }],
+      choices: [{ index: 0, delta: { reasoning_content: parsed.reasoningContent }, finish_reason: null }],
+    });
+  }
+  if (parsed.content) {
+    writeSse(res, null, {
+      id,
+      object: 'chat.completion.chunk',
+      created: nowUnix(),
+      model,
+      choices: [{ index: 0, delta: { content: parsed.content }, finish_reason: null }],
+    });
+  }
+  if (parsed.toolCalls) {
+    writeSse(res, null, {
+      id,
+      object: 'chat.completion.chunk',
+      created: nowUnix(),
+      model,
+      choices: [{ index: 0, delta: { tool_calls: parsed.toolCalls }, finish_reason: null }],
     });
   }
   writeSse(res, null, {
@@ -358,7 +410,7 @@ function sendOpenAiStream(res, body, content, usage) {
     object: 'chat.completion.chunk',
     created: nowUnix(),
     model,
-    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+    choices: [{ index: 0, delta: {}, finish_reason: parsed.finishReason || 'stop' }],
     usage: {
       prompt_tokens: usage.inputTokens,
       completion_tokens: usage.outputTokens,
@@ -369,8 +421,9 @@ function sendOpenAiStream(res, body, content, usage) {
   writeSseDone(res);
 }
 
-function sendAnthropicStream(res, body, content, usage) {
+function sendAnthropicStream(res, body, parsed) {
   const messageId = `msg_${randomUUID().slice(0, 12)}`;
+  const usage = parsed.usage;
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
@@ -398,17 +451,17 @@ function sendAnthropicStream(res, body, content, usage) {
     index: 0,
     content_block: { type: 'text', text: '' },
   });
-  if (content) {
+  if (parsed.content) {
     writeSse(res, 'content_block_delta', {
       type: 'content_block_delta',
       index: 0,
-      delta: { type: 'text_delta', text: content },
+      delta: { type: 'text_delta', text: parsed.content },
     });
   }
   writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
   writeSse(res, 'message_delta', {
     type: 'message_delta',
-    delta: { stop_reason: 'end_turn', stop_sequence: null },
+    delta: { stop_reason: mapAnthropicStopReason(parsed.finishReason), stop_sequence: null },
     usage: { output_tokens: usage.outputTokens },
   });
   writeSse(res, 'message_stop', { type: 'message_stop' });
@@ -447,9 +500,16 @@ export function createLegacyProxyHandlers({ config, fetchImpl }) {
 
     const model = body.model || 'deepseek/deepseek-v4-flash';
     if (body.stream) {
-      sendOpenAiStream(res, body, parsed.content, parsed.usage);
+      sendOpenAiStream(res, body, parsed);
       return { status: 200, upstreamStatus: response.status, usage: parsed.usage };
     }
+
+    const message = {
+      role: 'assistant',
+      content: parsed.content || null,
+    };
+    if (parsed.reasoningContent) message.reasoning_content = parsed.reasoningContent;
+    if (parsed.toolCalls) message.tool_calls = parsed.toolCalls;
 
     sendJson(res, 200, {
       id: `chatcmpl-${randomUUID().slice(0, 12)}`,
@@ -458,8 +518,8 @@ export function createLegacyProxyHandlers({ config, fetchImpl }) {
       model,
       choices: [{
         index: 0,
-        message: { role: 'assistant', content: parsed.content },
-        finish_reason: 'stop',
+        message,
+        finish_reason: parsed.finishReason || 'stop',
       }],
       usage: {
         prompt_tokens: parsed.usage.inputTokens,
@@ -487,7 +547,7 @@ export function createLegacyProxyHandlers({ config, fetchImpl }) {
       return { status: 429, upstreamStatus: response.status, usage: parsed.usage, proxyGeneratedError: 'zero_output' };
     }
     if (body.stream) {
-      sendAnthropicStream(res, body, parsed.content, parsed.usage);
+      sendAnthropicStream(res, body, parsed);
       return { status: 200, upstreamStatus: response.status, usage: parsed.usage };
     }
 
@@ -496,8 +556,8 @@ export function createLegacyProxyHandlers({ config, fetchImpl }) {
       type: 'message',
       role: 'assistant',
       model: body.model,
-      content: [{ type: 'text', text: parsed.content }],
-      stop_reason: 'end_turn',
+      content: parsed.content ? [{ type: 'text', text: parsed.content }] : [],
+      stop_reason: mapAnthropicStopReason(parsed.finishReason),
       stop_sequence: null,
       usage: {
         input_tokens: parsed.usage.inputTokens,
