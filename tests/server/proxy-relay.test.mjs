@@ -71,6 +71,136 @@ describe('relay proxy flow', () => {
     expect(usageTotal(app.db, relay.id)).toBe(30);
   });
 
+  it('normalizes OpenAI chat messages to the CommandCode CLI request format', async () => {
+    const upstreamCalls = [];
+    const app = await createInitializedApp({
+      fetch: async (url, init) => {
+        upstreamCalls.push({ url, init, body: JSON.parse(init.body) });
+        return fakeCcSseResponse({ inputTokens: 10, outputTokens: 20, cachedInputTokens: 3 });
+      },
+    });
+    await addEncryptedUpstreamKey(app, 'user_upstream_format');
+    const relay = await createRelayKey(app, { dailyTokenLimit: 1000 });
+
+    const res = await request(app, 'POST', '/v1/chat/completions', {
+      model: 'deepseek/deepseek-v4-flash',
+      max_tokens: 100,
+      messages: [
+        { role: 'system', content: 'Use concise Chinese.' },
+        { role: 'user', content: 'hello' },
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_weather',
+            type: 'function',
+            function: { name: 'get_weather', arguments: '{"city":"Shanghai"}' },
+          }],
+        },
+        { role: 'tool', tool_call_id: 'call_weather', content: 'sunny' },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'describe' },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,abc' } },
+          ],
+        },
+      ],
+    }, {
+      Authorization: `Bearer ${relay.plaintextKey}`,
+    });
+
+    expect(res.status).toBe(200);
+    const params = upstreamCalls[0].body.params;
+    expect(params.system).toBe('Use concise Chinese.');
+    expect(params.stream).toBe(true);
+    expect(params.messages).toEqual([
+      { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+      {
+        role: 'assistant',
+        content: [{
+          type: 'tool-call',
+          toolCallId: 'call_weather',
+          toolName: 'get_weather',
+          input: { city: 'Shanghai' },
+        }],
+      },
+      {
+        role: 'tool',
+        content: [{
+          type: 'tool-result',
+          toolCallId: 'call_weather',
+          toolName: 'get_weather',
+          output: { type: 'text', value: 'sunny' },
+        }],
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'describe' },
+          { type: 'image', image: 'data:image/png;base64,abc' },
+        ],
+      },
+    ]);
+  });
+
+  it('normalizes Anthropic messages before forwarding to CommandCode', async () => {
+    const upstreamCalls = [];
+    const app = await createInitializedApp({
+      fetch: async (url, init) => {
+        upstreamCalls.push({ url, init, body: JSON.parse(init.body) });
+        return fakeCcSseResponse({ inputTokens: 7, outputTokens: 9, cachedInputTokens: 1 });
+      },
+    });
+    await addEncryptedUpstreamKey(app, 'user_upstream_anthropic_format');
+    const relay = await createRelayKey(app, { dailyTokenLimit: 1000 });
+
+    const res = await request(app, 'POST', '/v1/messages', {
+      model: 'claude-sonnet-4-6',
+      max_tokens: 100,
+      system: [{ type: 'text', text: 'Reply in Chinese.' }],
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'weather?' }] },
+        {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'toolu_weather', name: 'get_weather', input: { city: 'Shanghai' } }],
+        },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_weather', content: 'sunny' }] },
+      ],
+      tools: [{ name: 'get_weather', description: 'weather lookup', input_schema: { type: 'object' } }],
+      tool_choice: { type: 'tool', name: 'get_weather' },
+    }, {
+      Authorization: `Bearer ${relay.plaintextKey}`,
+    });
+
+    expect(res.status).toBe(200);
+    const params = upstreamCalls[0].body.params;
+    expect(params.system).toBe('Reply in Chinese.');
+    expect(params.tools).toEqual([{ type: 'function', name: 'get_weather', description: 'weather lookup', input_schema: { type: 'object' } }]);
+    expect(params.tool_choice).toEqual({ type: 'tool', name: 'get_weather' });
+    expect(params.messages).toEqual([
+      { role: 'user', content: [{ type: 'text', text: 'weather?' }] },
+      {
+        role: 'assistant',
+        content: [{
+          type: 'tool-call',
+          toolCallId: 'toolu_weather',
+          toolName: 'get_weather',
+          input: { city: 'Shanghai' },
+        }],
+      },
+      {
+        role: 'tool',
+        content: [{
+          type: 'tool-result',
+          toolCallId: 'toolu_weather',
+          toolName: 'get_weather',
+          output: { type: 'text', value: 'sunny' },
+        }],
+      },
+    ]);
+  });
+
   it('does not mark upstream limited for proxy-generated zero-output errors', async () => {
     const app = await createInitializedApp({ fetch: async () => fakeZeroOutputCcResponse() });
     const upstreamId = await addEncryptedUpstreamKey(app, 'user_upstream_one');
