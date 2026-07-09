@@ -34,11 +34,13 @@ function renderPage(page) {
 export function App() {
   const [session, setSession] = useState(null);
   const [checking, setChecking] = useState(true);
+  const [authMode, setAuthMode] = useState('login');
   const [page, setPage] = useState('dashboard');
 
   useEffect(() => {
     api.session().then(({ payload }) => {
       setSession(payload?.ok ? payload.admin : null);
+      setAuthMode(payload?.needsInit ? 'init' : 'login');
     }).finally(() => setChecking(false));
   }, []);
 
@@ -48,13 +50,27 @@ export function App() {
     return payload;
   }
 
+  async function init(credentials) {
+    const { payload } = await api.init(credentials);
+    if (payload.ok) {
+      const loginResult = await api.login(credentials);
+      if (loginResult.payload.ok) {
+        setSession(loginResult.payload.admin);
+        setAuthMode('login');
+        return loginResult.payload;
+      }
+      setAuthMode('login');
+    }
+    return payload;
+  }
+
   async function logout() {
     await api.logout();
     setSession(null);
   }
 
   if (checking) return <div className="loading-screen">Loading</div>;
-  if (!session) return <AuthPage mode="login" onLogin={login} />;
+  if (!session) return <AuthPage mode={authMode} onLogin={login} onInit={init} />;
 
   return (
     <AppShell activePage={page} onNavigate={setPage} onLogout={logout}>

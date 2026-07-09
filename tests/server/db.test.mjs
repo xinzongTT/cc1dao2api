@@ -4,6 +4,7 @@ import { migrate } from '../../server/db/migrations.mjs';
 import { createAdminUser, countAdminUsers } from '../../server/db/repositories/adminUsers.mjs';
 import { getSetting, setSetting } from '../../server/db/repositories/settings.mjs';
 import { insertRoutingCursor, nextRoutingCursor } from '../../server/db/repositories/routingState.mjs';
+import { createUpstreamKey, selectRouteableUpstreamRoundRobin } from '../../server/db/repositories/upstreamKeys.mjs';
 
 function memoryDb() {
   const db = openDatabase(':memory:');
@@ -37,5 +38,14 @@ describe('database migrations', () => {
     insertRoutingCursor(db, 'upstream_round_robin', 0);
     expect(nextRoutingCursor(db, 'upstream_round_robin')).toBe(1);
     expect(nextRoutingCursor(db, 'upstream_round_robin')).toBe(2);
+  });
+
+  it('selects upstream and advances round-robin cursor atomically', () => {
+    const db = memoryDb();
+    createUpstreamKey(db, { name: 'one', encryptedKeyEnvelope: 'enc:v1:a:b:c:d', keyFingerprint: 'fp1' });
+    createUpstreamKey(db, { name: 'two', encryptedKeyEnvelope: 'enc:v1:a:b:c:e', keyFingerprint: 'fp2' });
+    expect(selectRouteableUpstreamRoundRobin(db).name).toBe('one');
+    expect(selectRouteableUpstreamRoundRobin(db).name).toBe('two');
+    expect(db.prepare('select cursor_value from routing_state where name = ?').get('upstream_round_robin').cursor_value).toBe(2);
   });
 });

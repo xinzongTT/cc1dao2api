@@ -37,6 +37,19 @@ function validBody() {
 }
 
 describe('relay proxy flow', () => {
+  it('requires a valid relay key for model listing', async () => {
+    const app = await createInitializedApp();
+    const missing = await request(app, 'GET', '/v1/models');
+    expect(missing.status).toBe(401);
+
+    const relay = await createRelayKey(app, { dailyTokenLimit: 1000 });
+    const ok = await request(app, 'GET', '/v1/models', null, {
+      Authorization: `Bearer ${relay.plaintextKey}`,
+    });
+    expect(ok.status).toBe(200);
+    expect(ok.body.object).toBe('list');
+  });
+
   it('accepts relay key, selects upstream key, and records usage', async () => {
     const upstreamCalls = [];
     const app = await createInitializedApp({
@@ -64,6 +77,7 @@ describe('relay proxy flow', () => {
     });
     expect(res.status).toBe(429);
     expect(getUpstreamKey(app.db, upstreamId).health_status).toBe('unknown');
+    expect(usageTotal(app.db, relay.id)).toBe(0);
   });
 
   it('parses real CommandCode ndjson usage events', async () => {
@@ -75,5 +89,42 @@ describe('relay proxy flow', () => {
     });
     expect(res.status).toBe(200);
     expect(usageTotal(app.db, relay.id)).toBe(33);
+  });
+
+  it('returns OpenAI-compatible server-sent events for streaming chat completions', async () => {
+    const app = await createInitializedApp({
+      fetch: async () => fakeCcSseResponse({ inputTokens: 10, outputTokens: 20, cachedInputTokens: 3 }),
+    });
+    await addEncryptedUpstreamKey(app, 'user_upstream_stream');
+    const relay = await createRelayKey(app, { dailyTokenLimit: 1000 });
+    const res = await request(app, 'POST', '/v1/chat/completions', { ...validBody(), stream: true }, {
+      Authorization: `Bearer ${relay.plaintextKey}`,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toContain('text/event-stream');
+    expect(res.text).toContain('"object":"chat.completion.chunk"');
+    expect(res.text).toContain('"content":"hello"');
+    expect(res.text).toContain('data: [DONE]');
+    expect(usageTotal(app.db, relay.id)).toBe(30);
+  });
+
+  it('returns Anthropic-compatible server-sent events for streaming messages', async () => {
+    const app = await createInitializedApp({
+      fetch: async () => fakeCcSseResponse({ inputTokens: 7, outputTokens: 9, cachedInputTokens: 1 }),
+    });
+    await addEncryptedUpstreamKey(app, 'user_upstream_anthropic_stream');
+    const relay = await createRelayKey(app, { dailyTokenLimit: 1000 });
+    const res = await request(app, 'POST', '/v1/messages', { ...validBody(), stream: true }, {
+      Authorization: `Bearer ${relay.plaintextKey}`,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toContain('text/event-stream');
+    expect(res.text).toContain('event: message_start');
+    expect(res.text).toContain('"type":"content_block_delta"');
+    expect(res.text).toContain('"text":"hello"');
+    expect(res.text).toContain('event: message_stop');
+    expect(usageTotal(app.db, relay.id)).toBe(16);
   });
 });

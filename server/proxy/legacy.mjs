@@ -35,6 +35,13 @@ function usageFromAny(raw = {}) {
   };
 }
 
+function normalizeUsage(usage) {
+  if (!usage || !Number(usage.outputTokens)) {
+    return { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
+  }
+  return usage;
+}
+
 function parseCcText(text) {
   let content = '';
   let usage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
@@ -81,6 +88,102 @@ function openAiError(message, type = 'invalid_request_error') {
   return { error: { message, type } };
 }
 
+function writeSse(res, event, data) {
+  if (event) res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function writeSseDone(res) {
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
+function sendOpenAiStream(res, body, content, usage) {
+  const id = `chatcmpl-${randomUUID().slice(0, 12)}`;
+  const model = body.model || 'deepseek/deepseek-v4-flash';
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+  });
+  writeSse(res, null, {
+    id,
+    object: 'chat.completion.chunk',
+    created: nowUnix(),
+    model,
+    choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+  });
+  if (content) {
+    writeSse(res, null, {
+      id,
+      object: 'chat.completion.chunk',
+      created: nowUnix(),
+      model,
+      choices: [{ index: 0, delta: { content }, finish_reason: null }],
+    });
+  }
+  writeSse(res, null, {
+    id,
+    object: 'chat.completion.chunk',
+    created: nowUnix(),
+    model,
+    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+    usage: {
+      prompt_tokens: usage.inputTokens,
+      completion_tokens: usage.outputTokens,
+      total_tokens: usage.inputTokens + usage.outputTokens,
+      prompt_tokens_details: { cached_tokens: usage.cachedInputTokens },
+    },
+  });
+  writeSseDone(res);
+}
+
+function sendAnthropicStream(res, body, content, usage) {
+  const messageId = `msg_${randomUUID().slice(0, 12)}`;
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+  });
+  writeSse(res, 'message_start', {
+    type: 'message_start',
+    message: {
+      id: messageId,
+      type: 'message',
+      role: 'assistant',
+      model: body.model,
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: {
+        input_tokens: usage.inputTokens,
+        output_tokens: 0,
+        cache_read_input_tokens: usage.cachedInputTokens,
+      },
+    },
+  });
+  writeSse(res, 'content_block_start', {
+    type: 'content_block_start',
+    index: 0,
+    content_block: { type: 'text', text: '' },
+  });
+  if (content) {
+    writeSse(res, 'content_block_delta', {
+      type: 'content_block_delta',
+      index: 0,
+      delta: { type: 'text_delta', text: content },
+    });
+  }
+  writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
+  writeSse(res, 'message_delta', {
+    type: 'message_delta',
+    delta: { stop_reason: 'end_turn', stop_sequence: null },
+    usage: { output_tokens: usage.outputTokens },
+  });
+  writeSse(res, 'message_stop', { type: 'message_stop' });
+  res.end();
+}
+
 async function forwardToCommandCode({ config, fetchImpl, upstreamKey, body }) {
   return fetchImpl(`${config.apiBase}/alpha/generate`, {
     method: 'POST',
@@ -104,12 +207,18 @@ export function createLegacyProxyHandlers({ config, fetchImpl }) {
     }
 
     const parsed = await parseUpstreamResponse(response);
+    parsed.usage = normalizeUsage(parsed.usage);
     if ((parsed.usage.outputTokens || 0) === 0) {
       sendJson(res, 429, { ...openAiError('Upstream returned zero output tokens', 'rate_limit_error'), retry_after: 1 });
       return { status: 429, upstreamStatus: response.status, usage: parsed.usage, proxyGeneratedError: 'zero_output' };
     }
 
     const model = body.model || 'deepseek/deepseek-v4-flash';
+    if (body.stream) {
+      sendOpenAiStream(res, body, parsed.content, parsed.usage);
+      return { status: 200, upstreamStatus: response.status, usage: parsed.usage };
+    }
+
     sendJson(res, 200, {
       id: `chatcmpl-${randomUUID().slice(0, 12)}`,
       object: 'chat.completion',
@@ -138,10 +247,16 @@ export function createLegacyProxyHandlers({ config, fetchImpl }) {
       return { status: response.status, upstreamStatus: response.status, usage: null };
     }
     const parsed = await parseUpstreamResponse(response);
+    parsed.usage = normalizeUsage(parsed.usage);
     if ((parsed.usage.outputTokens || 0) === 0) {
       sendJson(res, 429, { type: 'error', error: { type: 'rate_limit_error', message: 'Upstream returned zero output tokens' } });
       return { status: 429, upstreamStatus: response.status, usage: parsed.usage, proxyGeneratedError: 'zero_output' };
     }
+    if (body.stream) {
+      sendAnthropicStream(res, body, parsed.content, parsed.usage);
+      return { status: 200, upstreamStatus: response.status, usage: parsed.usage };
+    }
+
     sendJson(res, 200, {
       id: `msg_${randomUUID().slice(0, 12)}`,
       type: 'message',

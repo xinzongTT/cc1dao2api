@@ -46,6 +46,20 @@ describe('quota refresh and scheduler', () => {
     expect(row.quota_remaining_tokens).toBe(800);
   });
 
+  it('refreshes upstream quota through the admin api', async () => {
+    const app = await createInitializedApp({
+      fetch: async () => jsonResponse(200, { quota: { totalTokens: 2000, usedTokens: 500, remainingTokens: 1500 } }),
+    });
+    const upstreamId = await addEncryptedUpstreamKey(app, 'user_quota_route');
+
+    const res = await adminRequest(app, 'POST', `/admin/api/upstream-keys/${upstreamId}/refresh-quota`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.key.quotaStatus).toBe('success');
+    expect(res.body.key.quotaRemainingTokens).toBe(1500);
+    expect(getUpstreamKey(app.db, upstreamId).quota_remaining_tokens).toBe(1500);
+  });
+
   it('runs scheduler cleanup jobs on demand', async () => {
     const app = await createInitializedApp();
     const relay = await adminRequest(app, 'POST', '/admin/api/proxy-keys', { name: 'client', dailyTokenLimit: 1000, monthlyTokenLimit: 10000, allowedModels: [] });

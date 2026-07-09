@@ -1,6 +1,7 @@
 import { createUpstreamKey, deleteUpstreamKey, getUpstreamKey, listUpstreamKeys, setUpstreamHealth, updateUpstreamKey } from '../../db/repositories/upstreamKeys.mjs';
 import { readJsonBody } from '../../http/body.mjs';
 import { sendJson } from '../../http/router.mjs';
+import { refreshUpstreamQuota } from '../../quota/provider.mjs';
 import { encryptEnvelope } from '../../security/encryption.mjs';
 import { fingerprintSecret, maskSecret } from '../../security/keys.mjs';
 import { requireAdminSession } from './auth.mjs';
@@ -89,5 +90,18 @@ export function registerUpstreamKeyRoutes(router, ctx) {
     if (!row) return sendAdminError(res, 404, 'not_found', 'Upstream key not found');
     const updated = setUpstreamHealth(ctx.db, row.id, { healthStatus: 'healthy', errorMessage: null });
     return sendJson(res, 200, { ok: true, key: publicUpstreamKey(updated) });
+  });
+
+  router.add('POST', '/admin/api/upstream-keys/:id/refresh-quota', async (req, res) => {
+    if (!requireAdminSession(req, res, ctx)) return undefined;
+    const upstreamId = Number(req.params.id);
+    const result = await refreshUpstreamQuota(ctx, upstreamId);
+    const row = getUpstreamKey(ctx.db, upstreamId);
+    if (!row) return sendAdminError(res, 404, 'not_found', 'Upstream key not found');
+    return sendJson(res, result.ok ? 200 : 502, {
+      ok: result.ok,
+      key: publicUpstreamKey(row),
+      error: result.ok ? undefined : { code: 'quota_refresh_failed', message: result.message || 'Quota refresh failed' },
+    });
   });
 }

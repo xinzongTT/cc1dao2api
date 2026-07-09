@@ -1,9 +1,11 @@
 import { openDatabase } from '../db/connection.mjs';
 import { migrate } from '../db/migrations.mjs';
 import { decodeEncryptionKey, deriveRelayPepper } from '../security/secrets.mjs';
+import { createLoginRateLimiter, resolveSessionSecret } from '../security/sessions.mjs';
 
 export function createAdminContext(config, deps = {}) {
   const db = deps.db || openDatabase(config.databasePath);
+  const now = deps.now || (() => new Date());
   migrate(db);
   let encryptionKey = null;
   let encryptionError = null;
@@ -18,7 +20,9 @@ export function createAdminContext(config, deps = {}) {
     encryptionKey,
     encryptionError,
     relayPepper: encryptionKey ? deriveRelayPepper(encryptionKey, config.relayKeyPepper) : null,
+    sessionSecret: resolveSessionSecret(db, config.sessionSecret),
+    loginRateLimiter: deps.loginRateLimiter || createLoginRateLimiter({ now }),
     fetchImpl: deps.fetchImpl || deps.fetch || globalThis.fetch,
-    now: deps.now || (() => new Date()),
+    now,
   };
 }

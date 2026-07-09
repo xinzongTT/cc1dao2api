@@ -1,5 +1,5 @@
 import { readFile, stat } from 'node:fs/promises';
-import { resolve, join } from 'node:path';
+import { resolve, join, relative, isAbsolute } from 'node:path';
 
 const contentTypes = {
   '.html': 'text/html; charset=utf-8',
@@ -27,15 +27,22 @@ export async function serveStaticOrIndex(req, res, { rootDir, indexPath }) {
   const host = req.headers?.host || 'localhost';
   const url = new URL(req.url, `http://${host}`);
   const root = resolve(rootDir);
-  const pathname = decodeURIComponent(url.pathname);
+  const index = resolve(indexPath);
+  let pathname;
+  try {
+    pathname = decodeURIComponent(url.pathname);
+  } catch {
+    return false;
+  }
   let target = null;
 
   if (pathname === '/admin' || (pathname.startsWith('/admin/') && !pathname.startsWith('/admin/api/'))) {
-    target = indexPath;
+    target = index;
   } else {
-    const relative = pathname.replace(/^\/+/, '');
-    const candidate = resolve(join(root, relative));
-    if (candidate.startsWith(root) && await fileExists(candidate)) {
+    const requestRelativePath = pathname.replace(/^\/+/, '');
+    const candidate = resolve(join(root, requestRelativePath));
+    const rootRelativePath = relative(root, candidate);
+    if (!rootRelativePath.startsWith('..') && !isAbsolute(rootRelativePath) && await fileExists(candidate)) {
       target = candidate;
     }
   }

@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { findProxyKeyByHash, touchProxyKeyUsed } from '../db/repositories/proxyKeys.mjs';
-import { listRouteableUpstreamKeys, markUpstreamSuccess, setUpstreamHealth } from '../db/repositories/upstreamKeys.mjs';
-import { nextRoutingCursor } from '../db/repositories/routingState.mjs';
+import { selectRouteableUpstreamRoundRobin, markUpstreamSuccess, setUpstreamHealth } from '../db/repositories/upstreamKeys.mjs';
 import { recordUsageEvent, releaseReservation, reserveTokens, settleReservation } from '../db/repositories/usage.mjs';
 import { readJsonBody } from '../http/body.mjs';
 import { sendJson } from '../http/router.mjs';
@@ -43,10 +42,17 @@ function reservationBudget(body, config) {
 }
 
 function selectUpstream(db) {
-  const keys = listRouteableUpstreamKeys(db);
-  if (keys.length === 0) return null;
-  const cursor = nextRoutingCursor(db, 'upstream_round_robin');
-  return keys[(cursor - 1) % keys.length];
+  return selectRouteableUpstreamRoundRobin(db);
+}
+
+function authenticateRelayKey(req, ctx) {
+  const plaintextRelayKey = extractBearer(req);
+  if (!plaintextRelayKey || !plaintextRelayKey.startsWith('sk-ccp_') || !ctx.relayPepper) {
+    return null;
+  }
+  const proxyKey = findProxyKeyByHash(ctx.db, hashRelayKey(plaintextRelayKey, ctx.relayPepper));
+  if (!proxyKey || proxyKey.status !== 'enabled') return null;
+  return proxyKey;
 }
 
 function updateHealthFromResult(ctx, upstream, result) {
@@ -63,12 +69,8 @@ function updateHealthFromResult(ctx, upstream, result) {
 }
 
 async function relayBody({ req, res, ctx, endpoint, legacyHandler }) {
-  const plaintextRelayKey = extractBearer(req);
-  if (!plaintextRelayKey || !plaintextRelayKey.startsWith('sk-ccp_') || !ctx.relayPepper) {
-    return openAiError(res, 401, 'Missing or invalid relay key', 'auth_error');
-  }
-  const proxyKey = findProxyKeyByHash(ctx.db, hashRelayKey(plaintextRelayKey, ctx.relayPepper));
-  if (!proxyKey || proxyKey.status !== 'enabled') {
+  const proxyKey = authenticateRelayKey(req, ctx);
+  if (!proxyKey) {
     return openAiError(res, 401, 'Unknown or disabled relay key', 'auth_error');
   }
 
@@ -148,7 +150,10 @@ export function createRelayProxyHandlers(ctx) {
     handleMessages(req, res) {
       return relayBody({ req, res, ctx, endpoint: '/v1/messages', legacyHandler: legacy.handleMessagesBody });
     },
-    handleModels(_req, res) {
+    handleModels(req, res) {
+      if (!authenticateRelayKey(req, ctx)) {
+        return openAiError(res, 401, 'Unknown or disabled relay key', 'auth_error');
+      }
       return sendModelList(res);
     },
   };

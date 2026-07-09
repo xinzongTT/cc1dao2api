@@ -14,9 +14,13 @@ export function insertRoutingCursor(db, name, cursorValue = 0) {
 
 export function nextRoutingCursor(db, name) {
   return immediateTransaction(db, () => {
+    return nextRoutingCursorInTransaction(db, name);
+  });
+}
+
+export function nextRoutingCursorInTransaction(db, name) {
     const row = db.prepare('select cursor_value from routing_state where name = ?').get(name);
     const nextValue = (row?.cursor_value ?? 0) + 1;
     insertRoutingCursor(db, name, nextValue);
     return nextValue;
-  });
 }

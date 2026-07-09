@@ -48,7 +48,23 @@ export function createRouter() {
         return sendJson(res, 404, { error: { message: 'Not found', type: 'not_found' } });
       }
       req.params = params;
-      return route.handler(req, res, url, params);
+      try {
+        return await route.handler(req, res, url, params);
+      } catch (error) {
+        if (error.code === 'invalid_json') {
+          if (url.pathname.startsWith('/admin/api/')) {
+            return sendJson(res, 400, { ok: false, error: { code: 'invalid_json', message: 'Invalid JSON body' } });
+          }
+          return sendJson(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+        }
+        if (error.code === 'body_too_large') {
+          if (url.pathname.startsWith('/admin/api/')) {
+            return sendJson(res, 413, { ok: false, error: { code: 'body_too_large', message: 'Request body exceeds limit' } });
+          }
+          return sendJson(res, 413, { error: { message: 'Request body exceeds limit', type: 'invalid_request_error' } });
+        }
+        return sendJson(res, 500, { error: { message: 'Internal server error', type: 'internal_error' } });
+      }
     },
   };
 }

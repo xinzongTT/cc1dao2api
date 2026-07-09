@@ -1,3 +1,5 @@
+import { immediateTransaction } from '../connection.mjs';
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -38,6 +40,23 @@ export function listRouteableUpstreamKeys(db) {
     where admin_enabled = 1 and health_status in ('healthy', 'unknown')
     order by id
   `).all();
+}
+
+export function selectRouteableUpstreamRoundRobin(db, cursorName = 'upstream_round_robin') {
+  return immediateTransaction(db, () => selectRouteableUpstreamRoundRobinInTransaction(db, cursorName));
+}
+
+export function selectRouteableUpstreamRoundRobinInTransaction(db, cursorName = 'upstream_round_robin') {
+  const keys = listRouteableUpstreamKeys(db);
+  if (keys.length === 0) return null;
+  const row = db.prepare('select cursor_value from routing_state where name = ?').get(cursorName);
+  const cursor = (row?.cursor_value ?? 0) + 1;
+  db.prepare(`
+    insert into routing_state(name, cursor_value, updated_at)
+    values(?, ?, ?)
+    on conflict(name) do update set cursor_value = excluded.cursor_value, updated_at = excluded.updated_at
+  `).run(cursorName, cursor, nowIso());
+  return keys[(cursor - 1) % keys.length];
 }
 
 export function getUpstreamKey(db, id) {

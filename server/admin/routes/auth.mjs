@@ -5,7 +5,7 @@ import { readJsonBody } from '../../http/body.mjs';
 import { parseCookies, serializeCookie } from '../../http/cookies.mjs';
 import { sendJson } from '../../http/router.mjs';
 import { hashPassword, verifyPassword } from '../../security/passwords.mjs';
-import { createSession, findSession, isSafeOrigin, sessionCookieName, verifyCsrfToken } from '../../security/sessions.mjs';
+import { createSession, findSession, isSafeOrigin, sessionCookieName, signSessionId, verifyCsrfToken, verifySignedSessionId } from '../../security/sessions.mjs';
 
 function publicAdmin(admin) {
   return { id: admin.id, username: admin.username };
@@ -27,7 +27,7 @@ function sessionCookie(value, ctx, extra = {}) {
 
 export function getAdminSessionFromRequest(req, ctx) {
   const cookies = parseCookies(req.headers?.cookie || '');
-  const sessionId = cookies[sessionCookieName];
+  const sessionId = verifySignedSessionId(cookies[sessionCookieName], ctx.sessionSecret);
   if (!sessionId) return null;
   const session = findSession(ctx.db, sessionId, ctx.now());
   if (!session) return null;
@@ -82,15 +82,23 @@ export function registerAuthRoutes(router, ctx) {
     const body = await readJsonBody(req, 64 * 1024);
     const username = String(body.username || '').trim();
     const password = String(body.password || '');
+    const rateLimit = ctx.loginRateLimiter.check(username, req);
+    if (!rateLimit.ok) {
+      res.setHeader('Retry-After', String(rateLimit.retryAfterSeconds));
+      return sendAdminError(res, 429, 'rate_limited', 'Too many failed login attempts');
+    }
+
     const admin = username ? findAdminByUsername(ctx.db, username) : null;
     const valid = admin ? await verifyPassword(password, admin.password_salt, admin.password_hash) : false;
     if (!valid) {
+      ctx.loginRateLimiter.recordFailure(username, req);
       return sendAdminError(res, 401, 'invalid_credentials', 'Invalid username or password');
     }
 
     const session = createSession(ctx.db, admin.id, ctx.now());
+    ctx.loginRateLimiter.recordSuccess(username, req);
     touchAdminLogin(ctx.db, admin.id);
-    res.setHeader('Set-Cookie', sessionCookie(session.sessionId, ctx, { maxAge: 24 * 60 * 60 }));
+    res.setHeader('Set-Cookie', sessionCookie(signSessionId(session.sessionId, ctx.sessionSecret), ctx, { maxAge: 24 * 60 * 60 }));
     return sendJson(res, 200, {
       ok: true,
       admin: publicAdmin(admin),
@@ -109,7 +117,7 @@ export function registerAuthRoutes(router, ctx) {
 
   router.add('GET', '/admin/api/session', async (req, res) => {
     const current = getAdminSessionFromRequest(req, ctx);
-    if (!current) return sendJson(res, 200, { ok: false });
+    if (!current) return sendJson(res, 200, { ok: false, needsInit: countAdminUsers(ctx.db) === 0 });
     return sendJson(res, 200, {
       ok: true,
       admin: publicAdmin(current.admin),

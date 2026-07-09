@@ -62,7 +62,9 @@ export function usageTotal(db, proxyKeyId) {
 }
 
 export async function request(app, method, url, body = null, headers = {}) {
-  const payload = body == null ? [] : [Buffer.from(JSON.stringify(body))];
+  const payload = body == null
+    ? []
+    : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))];
   const req = Readable.from(payload);
   req.method = method;
   req.url = url;
