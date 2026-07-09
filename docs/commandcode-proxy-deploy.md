@@ -5,7 +5,7 @@
 ## 部署源
 
 - GitHub 仓库: `https://github.com/xinzongTT/cc1dao2api.git`
-- 部署分支: `feature/commandcode-admin`
+- 部署分支: `main`
 - 运行方式: `Node.js + systemd`
 - 监听地址: `0.0.0.0:3050`
 
