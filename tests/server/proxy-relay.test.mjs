@@ -28,6 +28,25 @@ function fakeCcNdjsonResponse() {
   });
 }
 
+function fakeCcFinishStepResponse() {
+  return new Response([
+    '{"type":"text-delta","text":"hello"}\n',
+    '{"type":"finish-step","finishReason":"stop","totalUsage":{"inputTokens":13,"outputTokens":17,"cachedInputTokens":2}}\n',
+  ].join(''), {
+    status: 200,
+    headers: { 'content-type': 'application/x-ndjson' },
+  });
+}
+
+function fakeCcErrorEventResponse() {
+  return new Response([
+    '{"type":"error","error":{"message":"upstream rejected request"}}\n',
+  ].join(''), {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream' },
+  });
+}
+
 function fakeReasoningOnlyCcResponse() {
   return new Response([
     '{"type":"start"}\n',
@@ -297,6 +316,24 @@ describe('relay proxy flow', () => {
     expect(usageTotal(app.db, relay.id)).toBe(33);
   });
 
+  it('parses original CommandCode finish-step usage events', async () => {
+    const app = await createInitializedApp({ fetch: async () => fakeCcFinishStepResponse() });
+    await addEncryptedUpstreamKey(app, 'user_upstream_finish_step');
+    const relay = await createRelayKey(app, { dailyTokenLimit: 1000 });
+    const res = await request(app, 'POST', '/v1/chat/completions', validBody(), {
+      Authorization: `Bearer ${relay.plaintextKey}`,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.choices[0].message.content).toBe('hello');
+    expect(res.body.usage).toMatchObject({
+      prompt_tokens: 13,
+      completion_tokens: 17,
+      total_tokens: 30,
+    });
+    expect(usageTotal(app.db, relay.id)).toBe(30);
+  });
+
   it('preserves CommandCode reasoning deltas in non-streaming OpenAI responses', async () => {
     const app = await createInitializedApp({ fetch: async () => fakeReasoningOnlyCcResponse() });
     await addEncryptedUpstreamKey(app, 'user_upstream_reasoning');
@@ -381,6 +418,21 @@ describe('relay proxy flow', () => {
     expect(firstWriteResult.text).toContain('"content":"hel"');
     expect(completed.text).toContain('data: [DONE]');
     expect(usageTotal(app.db, relay.id)).toBe(5);
+  });
+
+  it('emits Anthropic stream errors for original CommandCode error events', async () => {
+    const app = await createInitializedApp({ fetch: async () => fakeCcErrorEventResponse() });
+    await addEncryptedUpstreamKey(app, 'user_upstream_error_event');
+    const relay = await createRelayKey(app, { dailyTokenLimit: 1000 });
+    const res = await request(app, 'POST', '/v1/messages', { ...validBody(), stream: true }, {
+      Authorization: `Bearer ${relay.plaintextKey}`,
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.text).toContain('event: error');
+    expect(res.text).toContain('"error":{"type":"internal_error","message":"upstream rejected request"}');
+    expect(res.text).not.toContain('event: message_stop');
+    expect(usageTotal(app.db, relay.id)).toBe(0);
   });
 
   it('returns Anthropic-compatible server-sent events for streaming messages', async () => {

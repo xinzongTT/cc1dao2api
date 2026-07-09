@@ -607,6 +607,7 @@ async function streamAnthropicResponse(res, body, response) {
   let textBlockStarted = false;
   let currentIndex = 0;
   let sentMessageDelta = false;
+  let hasError = false;
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
@@ -685,6 +686,16 @@ async function streamAnthropicResponse(res, body, response) {
       currentIndex += 1;
     } else if (event?.type === 'finish') {
       emitFinish();
+    } else if (event?.type === 'error') {
+      hasError = true;
+      finishTextBlock();
+      writeSse(res, 'error', {
+        type: 'error',
+        error: {
+          type: 'internal_error',
+          message: event.error?.message || event.message || 'Unknown CC error',
+        },
+      });
     }
   }
 
@@ -709,7 +720,7 @@ async function streamAnthropicResponse(res, body, response) {
   buffer += decoder.decode();
   if (buffer.trim()) emitEvent(parseCcEventLine(buffer));
   parsed.usage = normalizeUsage(parsed.usage);
-  emitFinish();
+  if (!hasError) emitFinish();
   res.end();
   return parsed;
 }
