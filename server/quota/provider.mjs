@@ -10,7 +10,23 @@ function readNumber(...values) {
 }
 
 function parseQuotaPayload(payload) {
-  const quota = payload?.quota || payload;
+  const quota = payload?.quota || payload?.data?.quota || payload?.data || payload?.usage || payload;
+  const isUsageSummary = quota && (
+    Object.hasOwn(quota, 'totalCredits')
+    || Object.hasOwn(quota, 'totalMonthlyCredits')
+    || Object.hasOwn(quota, 'totalPurchasedCredits')
+    || Object.hasOwn(quota, 'totalCount')
+  );
+  if (isUsageSummary) {
+    const usedTokens = readNumber(quota.total_tokens, quota.totalTokens, quota.total);
+    if (usedTokens == null) return null;
+    return {
+      totalTokens: null,
+      usedTokens,
+      remainingTokens: null,
+      resetAt: quota.reset_at || quota.resetAt || null,
+    };
+  }
   const totalTokens = readNumber(quota.total_tokens, quota.totalTokens, quota.total);
   const usedTokens = readNumber(quota.used_tokens, quota.usedTokens, quota.used);
   let remainingTokens = readNumber(quota.remaining_tokens, quota.remainingTokens, quota.remaining);
@@ -30,9 +46,7 @@ function endpointCandidates(ctx) {
   const configured = getSetting(ctx.db, 'quota_provider_endpoint');
   return [
     configured,
-    `${ctx.config.apiBase}/provider/v1/quota`,
-    `${ctx.config.apiBase}/alpha/quota`,
-    `${ctx.config.apiBase}/quota`,
+    `${ctx.config.apiBase}/alpha/usage/summary`,
   ].filter(Boolean);
 }
 

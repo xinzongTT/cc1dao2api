@@ -36,6 +36,52 @@ describe('quota refresh and scheduler', () => {
     expect(row.quota_remaining_tokens).toBe(800);
   });
 
+  it('uses the real CommandCode usage summary endpoint for quota refresh', async () => {
+    const requestedUrls = [];
+    const app = await createInitializedApp({
+      fetch: async (url) => {
+        requestedUrls.push(url);
+        return jsonResponse(200, {
+          success: true,
+          totalTokens: 260400000,
+          totalCredits: 2.3,
+          totalMonthlyCredits: 2.3,
+          totalPurchasedCredits: 0,
+        });
+      },
+    });
+    const upstreamId = await addEncryptedUpstreamKey(app, 'user_usage_summary');
+
+    const result = await refreshUpstreamQuota(app.ctx, upstreamId);
+
+    expect(result.ok).toBe(true);
+    expect(requestedUrls).toEqual(['https://api.commandcode.ai/alpha/usage/summary']);
+    const row = getUpstreamKey(app.db, upstreamId);
+    expect(row.quota_status).toBe('success');
+    expect(row.quota_used_tokens).toBe(260400000);
+    expect(row.last_error_message).toBe(null);
+  });
+
+  it('parses wrapped CommandCode usage summary responses', async () => {
+    const app = await createInitializedApp({
+      fetch: async () => jsonResponse(200, {
+        success: true,
+        data: {
+          totalTokens: 1320,
+          totalCredits: 2.3,
+        },
+      }),
+    });
+    const upstreamId = await addEncryptedUpstreamKey(app, 'user_wrapped_usage_summary');
+
+    const result = await refreshUpstreamQuota(app.ctx, upstreamId);
+
+    expect(result.ok).toBe(true);
+    const row = getUpstreamKey(app.db, upstreamId);
+    expect(row.quota_status).toBe('success');
+    expect(row.quota_used_tokens).toBe(1320);
+  });
+
   it('keeps last quota snapshot on failure', async () => {
     const app = await createInitializedApp({ fetch: async () => jsonResponse(500, { error: 'fail' }) });
     const upstreamId = await addUpstreamWithQuota(app, { remaining: 800 });
