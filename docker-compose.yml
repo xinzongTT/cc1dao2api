@@ -11,6 +11,8 @@ services:
       SESSION_SECRET: "${SESSION_SECRET}"
       RELAY_KEY_PEPPER: "${RELAY_KEY_PEPPER:-}"
       CC_API_BASE: "${CC_API_BASE:-https://api.commandcode.ai}"
+      CC_CLI_VERSION: "${CC_CLI_VERSION:-0.43.1}"
+      CC_CLI_USER_AGENT: "${CC_CLI_USER_AGENT:-cli}"
     volumes:
       - cc-proxy-data:/app/data
     restart: unless-stopped
