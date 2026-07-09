@@ -273,49 +273,67 @@ function normalizeUsage(usage) {
   return usage;
 }
 
+function emptyParsedResponse() {
+  return {
+    content: '',
+    reasoningContent: '',
+    finishReason: 'stop',
+    toolCalls: null,
+    usage: { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 },
+  };
+}
+
+function parseCcEventLine(line) {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed.startsWith(':')) return null;
+  const data = trimmed.startsWith('data:') ? trimmed.slice(5).trim() : trimmed;
+  if (!data || data === '[DONE]') return null;
+  try {
+    return JSON.parse(data);
+  } catch {
+    return null;
+  }
+}
+
+function commandCodeToolCall(event) {
+  return {
+    id: event.toolCallId || `call_${randomUUID().slice(0, 8)}`,
+    type: 'function',
+    function: {
+      name: event.toolName || '',
+      arguments: typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {}),
+    },
+  };
+}
+
+function applyCcEvent(parsed, event) {
+  if (!event) return;
+  if (event.type === 'text-delta' && typeof event.text === 'string') parsed.content += event.text;
+  if (event.type === 'reasoning-delta' && typeof event.text === 'string') parsed.reasoningContent += event.text;
+  if (event.type === 'tool-call') {
+    parsed.toolCalls = parsed.toolCalls || [];
+    parsed.toolCalls.push(commandCodeToolCall(event));
+  }
+  if (typeof event.text === 'string' && !event.type) parsed.content += event.text;
+  if (typeof event.delta === 'string') parsed.content += event.delta;
+  if (typeof event.delta?.content === 'string') parsed.content += event.delta.content;
+  if (typeof event.choices?.[0]?.delta?.content === 'string') parsed.content += event.choices[0].delta.content;
+  if (typeof event.choices?.[0]?.delta?.reasoning_content === 'string') parsed.reasoningContent += event.choices[0].delta.reasoning_content;
+  if (typeof event.choices?.[0]?.message?.content === 'string') parsed.content += event.choices[0].message.content;
+  if (typeof event.choices?.[0]?.message?.reasoning_content === 'string') parsed.reasoningContent += event.choices[0].message.reasoning_content;
+  if (event.type === 'finish' && event.finishReason) parsed.finishReason = mapFinishReason(event.finishReason);
+  if (event.totalUsage) parsed.usage = usageFromAny(event.totalUsage);
+  if (event.usage) parsed.usage = usageFromAny(event.usage);
+}
+
 function parseCcText(text) {
-  let content = '';
-  let reasoningContent = '';
-  let finishReason = 'stop';
-  let toolCalls = null;
-  let usage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
+  const parsed = emptyParsedResponse();
 
   for (const line of text.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith(':')) continue;
-    const data = trimmed.startsWith('data:') ? trimmed.slice(5).trim() : trimmed;
-    if (!data || data === '[DONE]') continue;
-    try {
-      const event = JSON.parse(data);
-      if (event.type === 'text-delta' && typeof event.text === 'string') content += event.text;
-      if (event.type === 'reasoning-delta' && typeof event.text === 'string') reasoningContent += event.text;
-      if (event.type === 'tool-call') {
-        toolCalls = toolCalls || [];
-        toolCalls.push({
-          id: event.toolCallId || `call_${randomUUID().slice(0, 8)}`,
-          type: 'function',
-          function: {
-            name: event.toolName || '',
-            arguments: typeof event.input === 'string' ? event.input : JSON.stringify(event.input || {}),
-          },
-        });
-      }
-      if (typeof event.text === 'string' && !event.type) content += event.text;
-      if (typeof event.delta === 'string') content += event.delta;
-      if (typeof event.delta?.content === 'string') content += event.delta.content;
-      if (typeof event.choices?.[0]?.delta?.content === 'string') content += event.choices[0].delta.content;
-      if (typeof event.choices?.[0]?.delta?.reasoning_content === 'string') reasoningContent += event.choices[0].delta.reasoning_content;
-      if (typeof event.choices?.[0]?.message?.content === 'string') content += event.choices[0].message.content;
-      if (typeof event.choices?.[0]?.message?.reasoning_content === 'string') reasoningContent += event.choices[0].message.reasoning_content;
-      if (event.type === 'finish' && event.finishReason) finishReason = mapFinishReason(event.finishReason);
-      if (event.totalUsage) usage = usageFromAny(event.totalUsage);
-      if (event.usage) usage = usageFromAny(event.usage);
-    } catch {
-      // Ignore malformed upstream event lines; the caller still gets any parsed usage.
-    }
+    applyCcEvent(parsed, parseCcEventLine(line));
   }
 
-  return { content, reasoningContent, toolCalls, finishReason, usage };
+  return parsed;
 }
 
 async function parseUpstreamResponse(response) {
@@ -421,6 +439,121 @@ function sendOpenAiStream(res, body, parsed) {
   writeSseDone(res);
 }
 
+function openAiUsage(usage) {
+  return {
+    prompt_tokens: usage.inputTokens,
+    completion_tokens: usage.outputTokens,
+    total_tokens: usage.inputTokens + usage.outputTokens,
+    prompt_tokens_details: { cached_tokens: usage.cachedInputTokens },
+  };
+}
+
+function writeOpenAiChunk(res, { id, created, model, delta, finishReason = null, usage = null }) {
+  const chunk = {
+    id,
+    object: 'chat.completion.chunk',
+    created,
+    model,
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  };
+  if (usage) chunk.usage = openAiUsage(usage);
+  writeSse(res, null, chunk);
+}
+
+async function streamOpenAiResponse(res, body, response) {
+  const id = `chatcmpl-${randomUUID().slice(0, 12)}`;
+  const created = nowUnix();
+  const model = body.model || 'deepseek/deepseek-v4-flash';
+  const parsed = emptyParsedResponse();
+  let sentRole = false;
+  let sentFinish = false;
+  let toolCallIndex = 0;
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+
+  function deltaWithRole(delta) {
+    if (sentRole) return delta;
+    sentRole = true;
+    return { role: 'assistant', ...delta };
+  }
+
+  function emitEvent(event) {
+    applyCcEvent(parsed, event);
+    if (event?.type === 'text-delta') {
+      const text = event.text || event.delta || '';
+      if (text) writeOpenAiChunk(res, { id, created, model, delta: deltaWithRole({ content: text }) });
+    } else if (event?.type === 'reasoning-delta') {
+      const text = event.text || '';
+      if (text) writeOpenAiChunk(res, { id, created, model, delta: deltaWithRole({ reasoning_content: text }) });
+    } else if (event?.type === 'tool-call') {
+      const toolCall = commandCodeToolCall(event);
+      writeOpenAiChunk(res, {
+        id,
+        created,
+        model,
+        delta: deltaWithRole({
+          content: null,
+          tool_calls: [{
+            index: toolCallIndex,
+            ...toolCall,
+          }],
+        }),
+      });
+      toolCallIndex += 1;
+    } else if (event?.type === 'finish') {
+      sentFinish = true;
+      writeOpenAiChunk(res, {
+        id,
+        created,
+        model,
+        delta: {},
+        finishReason: parsed.finishReason || 'stop',
+        usage: parsed.usage,
+      });
+    }
+  }
+
+  const reader = response.body?.getReader?.();
+  if (!reader) {
+    const fallback = await parseUpstreamResponse(response);
+    fallback.usage = normalizeUsage(fallback.usage);
+    sendOpenAiStream(res, body, fallback);
+    return fallback;
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) emitEvent(parseCcEventLine(line));
+  }
+  buffer += decoder.decode();
+  if (buffer.trim()) emitEvent(parseCcEventLine(buffer));
+  parsed.usage = normalizeUsage(parsed.usage);
+
+  if (!sentFinish) {
+    writeOpenAiChunk(res, {
+      id,
+      created,
+      model,
+      delta: {},
+      finishReason: parsed.finishReason || 'stop',
+      usage: parsed.usage,
+    });
+  }
+  writeSseDone(res);
+  return parsed;
+}
+
 function sendAnthropicStream(res, body, parsed) {
   const messageId = `msg_${randomUUID().slice(0, 12)}`;
   const usage = parsed.usage;
@@ -468,6 +601,119 @@ function sendAnthropicStream(res, body, parsed) {
   res.end();
 }
 
+async function streamAnthropicResponse(res, body, response) {
+  const messageId = `msg_${randomUUID().slice(0, 12)}`;
+  const parsed = emptyParsedResponse();
+  let textBlockStarted = false;
+  let currentIndex = 0;
+  let sentMessageDelta = false;
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  writeSse(res, 'message_start', {
+    type: 'message_start',
+    message: {
+      id: messageId,
+      type: 'message',
+      role: 'assistant',
+      model: body.model,
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    },
+  });
+
+  function ensureTextBlock() {
+    if (textBlockStarted) return;
+    writeSse(res, 'content_block_start', {
+      type: 'content_block_start',
+      index: currentIndex,
+      content_block: { type: 'text', text: '' },
+    });
+    textBlockStarted = true;
+  }
+
+  function finishTextBlock() {
+    if (!textBlockStarted) return;
+    writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: currentIndex });
+    textBlockStarted = false;
+    currentIndex += 1;
+  }
+
+  function emitFinish() {
+    if (sentMessageDelta) return;
+    finishTextBlock();
+    writeSse(res, 'message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: mapAnthropicStopReason(parsed.finishReason), stop_sequence: null },
+      usage: { output_tokens: parsed.usage.outputTokens },
+    });
+    writeSse(res, 'message_stop', { type: 'message_stop' });
+    sentMessageDelta = true;
+  }
+
+  function emitEvent(event) {
+    applyCcEvent(parsed, event);
+    if (event?.type === 'text-delta') {
+      const text = event.text || event.delta || '';
+      if (!text) return;
+      ensureTextBlock();
+      writeSse(res, 'content_block_delta', {
+        type: 'content_block_delta',
+        index: currentIndex,
+        delta: { type: 'text_delta', text },
+      });
+    } else if (event?.type === 'tool-call') {
+      finishTextBlock();
+      const input = typeof event.input === 'string' ? tryParseJson(event.input) : (event.input || {});
+      writeSse(res, 'content_block_start', {
+        type: 'content_block_start',
+        index: currentIndex,
+        content_block: { type: 'tool_use', id: event.toolCallId || `call_${randomUUID().slice(0, 8)}`, name: event.toolName || '', input: {} },
+      });
+      writeSse(res, 'content_block_delta', {
+        type: 'content_block_delta',
+        index: currentIndex,
+        delta: { type: 'input_json_delta', partial_json: JSON.stringify(input) },
+      });
+      writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: currentIndex });
+      currentIndex += 1;
+    } else if (event?.type === 'finish') {
+      emitFinish();
+    }
+  }
+
+  const reader = response.body?.getReader?.();
+  if (!reader) {
+    const fallback = await parseUpstreamResponse(response);
+    fallback.usage = normalizeUsage(fallback.usage);
+    sendAnthropicStream(res, body, fallback);
+    return fallback;
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) emitEvent(parseCcEventLine(line));
+  }
+  buffer += decoder.decode();
+  if (buffer.trim()) emitEvent(parseCcEventLine(buffer));
+  parsed.usage = normalizeUsage(parsed.usage);
+  emitFinish();
+  res.end();
+  return parsed;
+}
+
 async function forwardToCommandCode({ config, fetchImpl, upstreamKey, body }) {
   return fetchImpl(`${config.apiBase}/alpha/generate`, {
     method: 'POST',
@@ -491,6 +737,11 @@ export function createLegacyProxyHandlers({ config, fetchImpl }) {
       return { status: response.status, upstreamStatus: response.status, usage: null };
     }
 
+    if (body.stream) {
+      const parsed = await streamOpenAiResponse(res, body, response);
+      return { status: 200, upstreamStatus: response.status, usage: parsed.usage };
+    }
+
     const parsed = await parseUpstreamResponse(response);
     parsed.usage = normalizeUsage(parsed.usage);
     if ((parsed.usage.outputTokens || 0) === 0) {
@@ -499,11 +750,6 @@ export function createLegacyProxyHandlers({ config, fetchImpl }) {
     }
 
     const model = body.model || 'deepseek/deepseek-v4-flash';
-    if (body.stream) {
-      sendOpenAiStream(res, body, parsed);
-      return { status: 200, upstreamStatus: response.status, usage: parsed.usage };
-    }
-
     const message = {
       role: 'assistant',
       content: parsed.content || null,
@@ -540,15 +786,16 @@ export function createLegacyProxyHandlers({ config, fetchImpl }) {
       sendJson(res, response.status, { type: 'error', error: { type: 'upstream_error', message: message || `Upstream error ${response.status}` } });
       return { status: response.status, upstreamStatus: response.status, usage: null };
     }
+    if (body.stream) {
+      const parsed = await streamAnthropicResponse(res, body, response);
+      return { status: 200, upstreamStatus: response.status, usage: parsed.usage };
+    }
+
     const parsed = await parseUpstreamResponse(response);
     parsed.usage = normalizeUsage(parsed.usage);
     if ((parsed.usage.outputTokens || 0) === 0) {
       sendJson(res, 429, { type: 'error', error: { type: 'rate_limit_error', message: 'Upstream returned zero output tokens' } });
       return { status: 429, upstreamStatus: response.status, usage: parsed.usage, proxyGeneratedError: 'zero_output' };
-    }
-    if (body.stream) {
-      sendAnthropicStream(res, body, parsed);
-      return { status: 200, upstreamStatus: response.status, usage: parsed.usage };
     }
 
     sendJson(res, 200, {

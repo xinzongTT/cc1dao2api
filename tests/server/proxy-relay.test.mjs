@@ -1,3 +1,4 @@
+import { Readable } from 'node:stream';
 import { describe, expect, it } from 'vitest';
 import { getUpstreamKey } from '../../server/db/repositories/upstreamKeys.mjs';
 import { addEncryptedUpstreamKey, createInitializedApp, createRelayKey, request, usageTotal } from './testUtils.mjs';
@@ -37,6 +38,66 @@ function fakeReasoningOnlyCcResponse() {
     status: 200,
     headers: { 'content-type': 'text/event-stream' },
   });
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+async function streamingRequest(app, method, url, body, headers = {}) {
+  const payload = [Buffer.from(JSON.stringify(body))];
+  const req = Readable.from(payload);
+  req.method = method;
+  req.url = url;
+  req.headers = {
+    host: '127.0.0.1',
+    'content-type': 'application/json',
+    ...Object.fromEntries(Object.entries(headers).map(([key, value]) => [key.toLowerCase(), value])),
+  };
+
+  const responseHeaders = {};
+  const chunks = [];
+  const firstWrite = deferred();
+  const res = {
+    statusCode: 200,
+    setHeader(name, value) {
+      responseHeaders[name.toLowerCase()] = value;
+    },
+    getHeader(name) {
+      return responseHeaders[name.toLowerCase()];
+    },
+    writeHead(status, headersToSet = {}) {
+      this.statusCode = status;
+      for (const [name, value] of Object.entries(headersToSet)) {
+        this.setHeader(name, value);
+      }
+    },
+    write(chunk) {
+      chunks.push(Buffer.from(chunk));
+      firstWrite.resolve(Buffer.concat(chunks).toString('utf8'));
+    },
+    end(chunk = '') {
+      if (chunk) chunks.push(Buffer.from(chunk));
+    },
+  };
+
+  const done = app.router.handle(req, res).then(() => ({
+    status: res.statusCode,
+    headers: responseHeaders,
+    text: Buffer.concat(chunks).toString('utf8'),
+  }));
+
+  return {
+    done,
+    firstWrite: firstWrite.promise,
+    getText: () => Buffer.concat(chunks).toString('utf8'),
+  };
 }
 
 function validBody() {
@@ -285,6 +346,43 @@ describe('relay proxy flow', () => {
     expect(usageTotal(app.db, relay.id)).toBe(11);
   });
 
+  it('streams OpenAI chunks as upstream CommandCode events arrive', async () => {
+    const encoder = new TextEncoder();
+    const controllerReady = deferred();
+    let upstreamController;
+    const app = await createInitializedApp({
+      fetch: async () => new Response(new ReadableStream({
+        start(controller) {
+          upstreamController = controller;
+          controllerReady.resolve(controller);
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      }),
+    });
+    await addEncryptedUpstreamKey(app, 'user_upstream_realtime_stream');
+    const relay = await createRelayKey(app, { dailyTokenLimit: 1000 });
+    const stream = await streamingRequest(app, 'POST', '/v1/chat/completions', { ...validBody(), stream: true }, {
+      Authorization: `Bearer ${relay.plaintextKey}`,
+    });
+
+    await controllerReady.promise;
+    upstreamController.enqueue(encoder.encode('{"type":"text-delta","text":"hel"}\n'));
+    const firstWriteResult = await Promise.race([
+      stream.firstWrite.then((text) => ({ type: 'write', text })),
+      new Promise((resolve) => setTimeout(() => resolve({ type: 'timeout' }), 50)),
+    ]);
+    upstreamController.enqueue(encoder.encode('{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":2,"outputTokens":3,"cachedInputTokens":0}}\n'));
+    upstreamController.close();
+    const completed = await stream.done;
+
+    expect(firstWriteResult.type).toBe('write');
+    expect(firstWriteResult.text).toContain('"content":"hel"');
+    expect(completed.text).toContain('data: [DONE]');
+    expect(usageTotal(app.db, relay.id)).toBe(5);
+  });
+
   it('returns Anthropic-compatible server-sent events for streaming messages', async () => {
     const app = await createInitializedApp({
       fetch: async () => fakeCcSseResponse({ inputTokens: 7, outputTokens: 9, cachedInputTokens: 1 }),
@@ -303,4 +401,56 @@ describe('relay proxy flow', () => {
     expect(res.text).toContain('event: message_stop');
     expect(usageTotal(app.db, relay.id)).toBe(16);
   });
+
+  it('streams Anthropic content blocks as upstream CommandCode events arrive', async () => {
+    const encoder = new TextEncoder();
+    const controllerReady = deferred();
+    let upstreamController;
+    const app = await createInitializedApp({
+      fetch: async () => new Response(new ReadableStream({
+        start(controller) {
+          upstreamController = controller;
+          controllerReady.resolve(controller);
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      }),
+    });
+    await addEncryptedUpstreamKey(app, 'user_upstream_anthropic_realtime');
+    const relay = await createRelayKey(app, { dailyTokenLimit: 1000 });
+    const stream = await streamingRequest(app, 'POST', '/v1/messages', {
+      model: 'deepseek/deepseek-v4-flash',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'hello' }],
+      stream: true,
+    }, {
+      Authorization: `Bearer ${relay.plaintextKey}`,
+    });
+
+    await controllerReady.promise;
+    upstreamController.enqueue(encoder.encode('{"type":"text-delta","text":"hel"}\n'));
+    const realtime = await waitForText(stream, '"type":"content_block_delta"', 50);
+    upstreamController.enqueue(encoder.encode('{"type":"finish","finishReason":"stop","totalUsage":{"inputTokens":2,"outputTokens":3,"cachedInputTokens":0}}\n'));
+    upstreamController.close();
+    const completed = await stream.done;
+
+    expect(realtime.type).toBe('found');
+    expect(realtime.text).toContain('"text":"hel"');
+    expect(completed.text).toContain('event: message_stop');
+    expect(usageTotal(app.db, relay.id)).toBe(5);
+  });
 });
+function waitForText(stream, pattern, timeoutMs = 50) {
+  return Promise.race([
+    new Promise((resolve) => {
+      const startedAt = Date.now();
+      const poll = () => {
+        if (stream.getText().includes(pattern)) return resolve({ type: 'found', text: stream.getText() });
+        if (Date.now() - startedAt >= timeoutMs) return resolve({ type: 'timeout', text: stream.getText() });
+        setTimeout(poll, 5);
+      };
+      poll();
+    }),
+  ]);
+}
