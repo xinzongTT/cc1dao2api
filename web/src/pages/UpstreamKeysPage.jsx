@@ -7,8 +7,10 @@ import { adminErrorMessage, adminRuntimeErrorMessage } from '../lib/errors.js';
 
 function quotaText(key) {
   if (key.quotaStatus === 'unknown') return '额度未知';
-  if (key.quotaRemainingTokens == null) return statusText(key.quotaStatus);
-  return `剩余 ${key.quotaRemainingTokens.toLocaleString()} 令牌`;
+  if (key.quotaRemainingTokens != null) return `剩余 ${key.quotaRemainingTokens.toLocaleString()} 令牌`;
+  if (key.quotaUsedTokens != null) return `已用 ${key.quotaUsedTokens.toLocaleString()} 令牌`;
+  if (key.quotaTotalTokens != null) return `总量 ${key.quotaTotalTokens.toLocaleString()} 令牌`;
+  return statusText(key.quotaStatus);
 }
 
 export function UpstreamKeysPage({ api }) {

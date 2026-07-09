@@ -38,6 +38,11 @@ describe('key management pages', () => {
     expect(await screen.findByText('成功')).toBeInTheDocument();
   });
 
+  it('shows used token snapshots when remaining quota is unavailable', async () => {
+    render(<UpstreamKeysPage api={fakeApi({ upstreamKeys: [{ id: 3, name: 'main', maskedKey: 'user_abcd...wxyz', quotaStatus: 'success', quotaUsedTokens: 260859401 }] })} />);
+    expect(await screen.findByText('已用 260,859,401 令牌')).toBeInTheDocument();
+  });
+
   it('localizes upstream error messages from persisted quota checks', async () => {
     render(<UpstreamKeysPage api={fakeApi({
       upstreamKeys: [{

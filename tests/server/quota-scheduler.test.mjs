@@ -36,7 +36,7 @@ describe('quota refresh and scheduler', () => {
     expect(row.quota_remaining_tokens).toBe(800);
   });
 
-  it('uses the real CommandCode usage summary endpoint for quota refresh', async () => {
+  it('uses the CommandCode API-key usage summary endpoint for quota refresh', async () => {
     const requestedUrls = [];
     const app = await createInitializedApp({
       fetch: async (url) => {
