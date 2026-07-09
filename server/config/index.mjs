@@ -1,9 +1,13 @@
+import { DEFAULT_COMMAND_CODE_CLI_USER_AGENT, DEFAULT_COMMAND_CODE_CLI_VERSION } from '../commandCodeHeaders.mjs';
+
 export function loadConfig(env = process.env, cwd = process.cwd()) {
   return {
     port: Number.parseInt(env.PORT || '3000', 10),
     host: env.HOST || '0.0.0.0',
     apiBase: env.CC_API_BASE || 'https://api.commandcode.ai',
     projectSlug: env.PROJECT_SLUG || 'cc-proxy',
+    cliVersion: env.CC_CLI_VERSION || DEFAULT_COMMAND_CODE_CLI_VERSION,
+    cliUserAgent: env.CC_CLI_USER_AGENT || DEFAULT_COMMAND_CODE_CLI_USER_AGENT,
     databasePath: env.DATABASE_PATH || '/app/data/cc-proxy.sqlite',
     logFile: env.LOG_FILE || '',
     logLevel: env.LOG_LEVEL || 'info',

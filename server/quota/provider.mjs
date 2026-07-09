@@ -1,3 +1,4 @@
+import { buildCommandCodeHeaders } from '../commandCodeHeaders.mjs';
 import { getSetting } from '../db/repositories/settings.mjs';
 import { getUpstreamKey, setUpstreamQuota } from '../db/repositories/upstreamKeys.mjs';
 import { decryptEnvelope } from '../security/encryption.mjs';
@@ -63,12 +64,12 @@ function parseQuotaPayload(payload) {
   };
 }
 
-function authHeaders(plaintext) {
-  return { Authorization: `Bearer ${plaintext}`, 'x-cli-environment': 'production' };
+function authHeaders(plaintext, config) {
+  return buildCommandCodeHeaders({ config, apiKey: plaintext });
 }
 
 async function fetchJson(ctx, endpoint, plaintext) {
-  const response = await ctx.fetchImpl(endpoint, { headers: authHeaders(plaintext) });
+  const response = await ctx.fetchImpl(endpoint, { headers: authHeaders(plaintext, ctx.config) });
   if (!response.ok) return null;
   return response.json();
 }
@@ -129,7 +130,7 @@ export async function refreshUpstreamQuota(ctx, upstreamKeyId) {
   for (const endpoint of endpointCandidates(ctx)) {
     try {
       const response = await ctx.fetchImpl(endpoint, {
-        headers: { Authorization: `Bearer ${plaintext}`, 'x-cli-environment': 'production' },
+        headers: authHeaders(plaintext, ctx.config),
       });
       if (!response.ok) {
         lastMessage = `Quota endpoint returned ${response.status}`;

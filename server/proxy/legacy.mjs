@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { buildCommandCodeHeaders } from '../commandCodeHeaders.mjs';
 import { sendJson } from '../http/router.mjs';
 
 function nowUnix() {
@@ -187,12 +188,12 @@ function sendAnthropicStream(res, body, content, usage) {
 async function forwardToCommandCode({ config, fetchImpl, upstreamKey, body }) {
   return fetchImpl(`${config.apiBase}/alpha/generate`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${upstreamKey}`,
-      'x-cli-environment': 'production',
-      'x-project-slug': config.projectSlug || 'cc-proxy',
-    },
+    headers: buildCommandCodeHeaders({
+      config,
+      apiKey: upstreamKey,
+      contentType: 'application/json',
+      projectSlug: config.projectSlug || 'cc-proxy',
+    }),
     body: JSON.stringify(buildCcBody(body)),
   });
 }

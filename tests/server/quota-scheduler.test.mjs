@@ -63,10 +63,10 @@ describe('quota refresh and scheduler', () => {
   });
 
   it('stores CommandCode credit usage and billing reset snapshots', async () => {
-    const requestedUrls = [];
+    const upstreamCalls = [];
     const app = await createInitializedApp({
-      fetch: async (url) => {
-        requestedUrls.push(url);
+      fetch: async (url, init) => {
+        upstreamCalls.push({ url, init });
         if (url === 'https://api.commandcode.ai/alpha/usage/summary') {
           return jsonResponse(200, {
             totalTokens: 260859401,
@@ -100,11 +100,17 @@ describe('quota refresh and scheduler', () => {
     const result = await refreshUpstreamQuota(app.ctx, upstreamId);
 
     expect(result.ok).toBe(true);
-    expect(requestedUrls).toEqual([
+    expect(upstreamCalls.map((call) => call.url)).toEqual([
       'https://api.commandcode.ai/alpha/usage/summary',
       'https://api.commandcode.ai/alpha/billing/credits',
       'https://api.commandcode.ai/alpha/billing/subscriptions',
     ]);
+    for (const call of upstreamCalls) {
+      expect(call.init.headers.Authorization).toBe('Bearer user_credit_summary');
+      expect(call.init.headers['x-cli-environment']).toBe('production');
+      expect(call.init.headers['x-command-code-version']).toBe('0.43.1');
+      expect(call.init.headers['User-Agent']).toBe('cli');
+    }
     const row = getUpstreamKey(app.db, upstreamId);
     expect(row.quota_used_tokens).toBe(260859401);
     expect(row.quota_used_credits).toBeCloseTo(2.3478, 4);

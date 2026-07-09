@@ -65,6 +65,9 @@ describe('relay proxy flow', () => {
     });
     expect(res.status).toBe(200);
     expect(upstreamCalls[0].init.headers.Authorization).toBe('Bearer user_upstream_one');
+    expect(upstreamCalls[0].init.headers['x-cli-environment']).toBe('production');
+    expect(upstreamCalls[0].init.headers['x-command-code-version']).toBe('0.43.1');
+    expect(upstreamCalls[0].init.headers['User-Agent']).toBe('cli');
     expect(usageTotal(app.db, relay.id)).toBe(30);
   });
 
