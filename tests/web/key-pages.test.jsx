@@ -43,6 +43,24 @@ describe('key management pages', () => {
     expect(await screen.findByText('已用 260,859,401 令牌')).toBeInTheDocument();
   });
 
+  it('shows compact monthly credit usage snapshots', async () => {
+    render(<UpstreamKeysPage api={fakeApi({
+      upstreamKeys: [{
+        id: 4,
+        name: 'main',
+        maskedKey: 'user_abcd...wxyz',
+        quotaStatus: 'success',
+        quotaUsedTokens: 260859401,
+        quotaUsedCredits: 2.3478,
+        quotaRemainingCredits: 7.6489,
+        quotaTotalCredits: 9.9967,
+        quotaResetAt: '2026-08-04T11:28:34.000Z',
+      }],
+    })} />);
+    expect(await screen.findByText('$2.35 / $10.00 · 23%')).toBeInTheDocument();
+    expect(screen.getByText('8月4日重置 · 已用 260,859,401 令牌')).toBeInTheDocument();
+  });
+
   it('localizes upstream error messages from persisted quota checks', async () => {
     render(<UpstreamKeysPage api={fakeApi({
       upstreamKeys: [{

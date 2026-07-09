@@ -13,6 +13,37 @@ function quotaText(key) {
   return statusText(key.quotaStatus);
 }
 
+function formatUsd(value) {
+  return `$${Number(value).toFixed(2)}`;
+}
+
+function formatResetDate(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return `${date.getMonth() + 1}月${date.getDate()}日重置`;
+}
+
+function tokenSnapshotText(key) {
+  if (key.quotaUsedTokens != null) return `已用 ${key.quotaUsedTokens.toLocaleString()} 令牌`;
+  if (key.quotaRemainingTokens != null) return `剩余 ${key.quotaRemainingTokens.toLocaleString()} 令牌`;
+  if (key.quotaTotalTokens != null) return `总量 ${key.quotaTotalTokens.toLocaleString()} 令牌`;
+  return null;
+}
+
+function QuotaSnapshot({ row }) {
+  if (row.quotaUsedCredits != null && row.quotaTotalCredits != null) {
+    const percent = row.quotaTotalCredits > 0 ? Math.round((row.quotaUsedCredits / row.quotaTotalCredits) * 100) : 0;
+    const details = [formatResetDate(row.quotaResetAt), tokenSnapshotText(row)].filter(Boolean).join(' · ');
+    return (
+      <div className="quota-snapshot">
+        <div className="quota-credit-line tabular">{formatUsd(row.quotaUsedCredits)} / {formatUsd(row.quotaTotalCredits)} · {percent}%</div>
+        {details ? <div className="quota-meta-line">{details}</div> : null}
+      </div>
+    );
+  }
+  return <span>{quotaText(row)}</span>;
+}
+
 export function UpstreamKeysPage({ api }) {
   const [keys, setKeys] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -73,7 +104,7 @@ export function UpstreamKeysPage({ api }) {
     { key: 'name', header: '名称' },
     { key: 'maskedKey', header: '掩码密钥', render: (row) => <code>{row.maskedKey}</code> },
     { key: 'healthStatus', header: '健康状态', render: (row) => <StatusBadge status={row.healthStatus} /> },
-    { key: 'quotaStatus', header: '额度', render: (row) => <span>{quotaText(row)}</span> },
+    { key: 'quotaStatus', header: '额度', render: (row) => <QuotaSnapshot row={row} /> },
     { key: 'lastQuotaCheckedAt', header: '最近刷新', render: (row) => row.lastQuotaCheckedAt || '从未' },
     { key: 'lastSuccessAt', header: '最近成功', render: (row) => row.lastSuccessAt || '从未' },
     { key: 'lastErrorMessage', header: '最近错误', render: (row) => adminRuntimeErrorMessage(row.lastErrorMessage) },

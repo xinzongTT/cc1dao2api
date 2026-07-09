@@ -55,11 +55,62 @@ describe('quota refresh and scheduler', () => {
     const result = await refreshUpstreamQuota(app.ctx, upstreamId);
 
     expect(result.ok).toBe(true);
-    expect(requestedUrls).toEqual(['https://api.commandcode.ai/alpha/usage/summary']);
+    expect(requestedUrls[0]).toBe('https://api.commandcode.ai/alpha/usage/summary');
     const row = getUpstreamKey(app.db, upstreamId);
     expect(row.quota_status).toBe('success');
     expect(row.quota_used_tokens).toBe(260400000);
     expect(row.last_error_message).toBe(null);
+  });
+
+  it('stores CommandCode credit usage and billing reset snapshots', async () => {
+    const requestedUrls = [];
+    const app = await createInitializedApp({
+      fetch: async (url) => {
+        requestedUrls.push(url);
+        if (url === 'https://api.commandcode.ai/alpha/usage/summary') {
+          return jsonResponse(200, {
+            totalTokens: 260859401,
+            totalCost: 2.3478,
+            totalCredits: 2.3478,
+            totalMonthlyCredits: 2.3478,
+            totalPurchasedCredits: 0,
+            totalFreeCredits: 0,
+          });
+        }
+        if (url === 'https://api.commandcode.ai/alpha/billing/credits') {
+          return jsonResponse(200, {
+            credits: {
+              monthlyCredits: 7.6489,
+              purchasedCredits: 0,
+              freeCredits: 0,
+            },
+          });
+        }
+        if (url === 'https://api.commandcode.ai/alpha/billing/subscriptions') {
+          return jsonResponse(200, {
+            success: true,
+            data: { currentPeriodEnd: '2026-08-04T11:28:34.000Z' },
+          });
+        }
+        return jsonResponse(404, { error: 'not found' });
+      },
+    });
+    const upstreamId = await addEncryptedUpstreamKey(app, 'user_credit_summary');
+
+    const result = await refreshUpstreamQuota(app.ctx, upstreamId);
+
+    expect(result.ok).toBe(true);
+    expect(requestedUrls).toEqual([
+      'https://api.commandcode.ai/alpha/usage/summary',
+      'https://api.commandcode.ai/alpha/billing/credits',
+      'https://api.commandcode.ai/alpha/billing/subscriptions',
+    ]);
+    const row = getUpstreamKey(app.db, upstreamId);
+    expect(row.quota_used_tokens).toBe(260859401);
+    expect(row.quota_used_credits).toBeCloseTo(2.3478, 4);
+    expect(row.quota_remaining_credits).toBeCloseTo(7.6489, 4);
+    expect(row.quota_total_credits).toBeCloseTo(9.9967, 4);
+    expect(row.quota_reset_at).toBe('2026-08-04T11:28:34.000Z');
   });
 
   it('parses wrapped CommandCode usage summary responses', async () => {

@@ -27,6 +27,9 @@ export function migrate(db) {
       quota_total_tokens integer,
       quota_used_tokens integer,
       quota_remaining_tokens integer,
+      quota_total_credits real,
+      quota_used_credits real,
+      quota_remaining_credits real,
       quota_reset_at text,
       last_quota_checked_at text,
       last_success_at text,
@@ -150,6 +153,17 @@ export function migrate(db) {
     create index if not exists idx_usage_daily_bucket on usage_daily(bucket_start);
     create index if not exists idx_usage_reservations_proxy_status on usage_reservations(proxy_key_id, status);
   `);
+
+  const upstreamColumns = new Set(db.prepare('pragma table_info(upstream_keys)').all().map((column) => column.name));
+  for (const [name, definition] of [
+    ['quota_total_credits', 'real'],
+    ['quota_used_credits', 'real'],
+    ['quota_remaining_credits', 'real'],
+  ]) {
+    if (!upstreamColumns.has(name)) {
+      db.exec(`alter table upstream_keys add column ${name} ${definition}`);
+    }
+  }
 
   db.prepare(`
     insert or ignore into schema_migrations(version, applied_at)

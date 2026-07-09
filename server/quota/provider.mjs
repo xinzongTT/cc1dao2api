@@ -9,6 +9,18 @@ function readNumber(...values) {
   return null;
 }
 
+function sumNumbers(...values) {
+  let total = 0;
+  let hasValue = false;
+  for (const value of values) {
+    if (value !== undefined && value !== null && Number.isFinite(Number(value))) {
+      total += Number(value);
+      hasValue = true;
+    }
+  }
+  return hasValue ? total : null;
+}
+
 function parseQuotaPayload(payload) {
   const quota = payload?.quota || payload?.data?.quota || payload?.data || payload?.usage || payload;
   const isUsageSummary = quota && (
@@ -19,11 +31,16 @@ function parseQuotaPayload(payload) {
   );
   if (isUsageSummary) {
     const usedTokens = readNumber(quota.total_tokens, quota.totalTokens, quota.total);
+    const usedCredits = readNumber(quota.totalCost, quota.totalCredits, quota.totalMonthlyCredits, quota.creditsTotal);
     if (usedTokens == null) return null;
     return {
+      isUsageSummary: true,
       totalTokens: null,
       usedTokens,
       remainingTokens: null,
+      totalCredits: null,
+      usedCredits,
+      remainingCredits: null,
       resetAt: quota.reset_at || quota.resetAt || null,
     };
   }
@@ -35,10 +52,52 @@ function parseQuotaPayload(payload) {
   }
   if (totalTokens == null && usedTokens == null && remainingTokens == null) return null;
   return {
+    isUsageSummary: false,
     totalTokens,
     usedTokens,
     remainingTokens,
+    totalCredits: readNumber(quota.total_credits, quota.totalCredits),
+    usedCredits: readNumber(quota.used_credits, quota.usedCredits),
+    remainingCredits: readNumber(quota.remaining_credits, quota.remainingCredits),
     resetAt: quota.reset_at || quota.resetAt || null,
+  };
+}
+
+function authHeaders(plaintext) {
+  return { Authorization: `Bearer ${plaintext}`, 'x-cli-environment': 'production' };
+}
+
+async function fetchJson(ctx, endpoint, plaintext) {
+  const response = await ctx.fetchImpl(endpoint, { headers: authHeaders(plaintext) });
+  if (!response.ok) return null;
+  return response.json();
+}
+
+function readCreditsSnapshot(payload, usedCredits) {
+  const credits = payload?.credits || payload?.data?.credits || payload?.data || payload;
+  const remainingMonthlyCredits = readNumber(credits?.monthlyCredits, credits?.monthly_credits);
+  const fallbackMonthlyCredits = sumNumbers(credits?.opensourceMonthlyCredits, credits?.premiumMonthlyCredits);
+  const monthlyCredits = remainingMonthlyCredits ?? fallbackMonthlyCredits;
+  const remainingCredits = sumNumbers(monthlyCredits, credits?.purchasedCredits, credits?.purchased_credits, credits?.freeCredits, credits?.free_credits);
+  return {
+    remainingCredits,
+    totalCredits: usedCredits != null && remainingCredits != null ? usedCredits + remainingCredits : null,
+  };
+}
+
+function readSubscriptionResetAt(payload) {
+  const subscription = payload?.data || payload?.subscription || payload;
+  return subscription?.currentPeriodEnd || subscription?.current_period_end || null;
+}
+
+async function fetchCommandCodeBillingSnapshot(ctx, plaintext, usedCredits) {
+  const [creditsPayload, subscriptionPayload] = await Promise.all([
+    fetchJson(ctx, `${ctx.config.apiBase}/alpha/billing/credits`, plaintext).catch(() => null),
+    fetchJson(ctx, `${ctx.config.apiBase}/alpha/billing/subscriptions`, plaintext).catch(() => null),
+  ]);
+  return {
+    ...(creditsPayload ? readCreditsSnapshot(creditsPayload, usedCredits) : {}),
+    resetAt: subscriptionPayload ? readSubscriptionResetAt(subscriptionPayload) : null,
   };
 }
 
@@ -77,10 +136,17 @@ export async function refreshUpstreamQuota(ctx, upstreamKeyId) {
         continue;
       }
       const payload = await response.json();
-      const quota = parseQuotaPayload(payload);
-      if (!quota) {
+      const parsed = parseQuotaPayload(payload);
+      if (!parsed) {
         lastMessage = 'Quota response was not recognized';
         continue;
+      }
+      const { isUsageSummary, ...quota } = parsed;
+      if (isUsageSummary) {
+        const billing = await fetchCommandCodeBillingSnapshot(ctx, plaintext, quota.usedCredits);
+        quota.totalCredits = billing.totalCredits ?? quota.totalCredits;
+        quota.remainingCredits = billing.remainingCredits ?? quota.remainingCredits;
+        quota.resetAt = billing.resetAt ?? quota.resetAt;
       }
       setUpstreamQuota(ctx.db, upstreamKeyId, { quotaStatus: 'success', ...quota, errorMessage: null });
       return { ok: true, status: 'success', quota };

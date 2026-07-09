@@ -337,6 +337,23 @@ button:disabled {
   font-size: .84rem;
 }
 
+.quota-snapshot {
+  display: grid;
+  gap: 3px;
+  min-width: 190px;
+}
+
+.quota-credit-line {
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.quota-meta-line {
+  color: var(--muted);
+  font-size: .78rem;
+  white-space: nowrap;
+}
+
 .action-row {
   display: flex;
   gap: 6px;
