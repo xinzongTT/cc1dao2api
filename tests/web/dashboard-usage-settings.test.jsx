@@ -13,7 +13,7 @@ function fakeDashboardApi() {
         ok: true,
         kpis: { totalRequests: 10, todayTokens: 33, successRate: 0.9, availableUpstreamKeys: 2, unknownQuotaKeys: 1, recentErrors: 1 },
         tokenTrend: [{ bucket_start: '2026-07-08T00:00:00.000Z', total_tokens: 33 }],
-        upstreamQuota: [],
+        upstreamQuota: [{ id: 1, name: 'main', quotaStatus: 'success', remainingTokens: null }],
         recentErrors: [],
         recentRequests: [],
       },
@@ -36,8 +36,9 @@ function fakeSettingsApi(environment) {
 describe('dashboard usage and settings pages', () => {
   it('renders dashboard kpis and token trend', async () => {
     render(<DashboardPage api={fakeDashboardApi()} />);
-    expect(await screen.findByText('Today tokens')).toBeInTheDocument();
-    expect(screen.getByText('Available upstream keys')).toBeInTheDocument();
+    expect(await screen.findByText('今日 Token')).toBeInTheDocument();
+    expect(screen.getByText('可用上游密钥')).toBeInTheDocument();
+    expect(screen.getByText('成功')).toBeInTheDocument();
   });
 
   it('renders settings environment state without secret values', async () => {

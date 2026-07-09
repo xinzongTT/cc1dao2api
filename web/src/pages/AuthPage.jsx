@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Eye, EyeOff, ShieldCheck } from 'lucide-react';
+import { adminErrorMessage } from '../lib/errors.js';
 
 export function AuthPage({ mode = 'login', onLogin, onInit }) {
   const [username, setUsername] = useState('');
@@ -17,10 +18,10 @@ export function AuthPage({ mode = 'login', onLogin, onInit }) {
       const action = isInit ? onInit : onLogin;
       const result = await action({ username, password });
       if (result?.ok === false) {
-        setError(result.error?.message || 'Request failed');
+        setError(adminErrorMessage(result.error));
       }
     } catch (err) {
-      setError(err.message || 'Request failed');
+      setError('请求失败');
     } finally {
       setLoading(false);
     }
@@ -32,9 +33,9 @@ export function AuthPage({ mode = 'login', onLogin, onInit }) {
         <div className="auth-icon" aria-hidden="true">
           <ShieldCheck size={24} strokeWidth={1.8} />
         </div>
-        <h1>{isInit ? 'Initialize admin' : 'Admin sign in'}</h1>
+        <h1>{isInit ? '初始化管理员' : '管理员登录'}</h1>
         <label className="field">
-          <span>Username</span>
+          <span>用户名</span>
           <input
             value={username}
             onChange={(event) => setUsername(event.target.value)}
@@ -43,7 +44,7 @@ export function AuthPage({ mode = 'login', onLogin, onInit }) {
           />
         </label>
         <label className="field">
-          <span>Password</span>
+          <span>密码</span>
           <div className="password-row">
             <input
               type={showPassword ? 'text' : 'password'}
@@ -56,7 +57,7 @@ export function AuthPage({ mode = 'login', onLogin, onInit }) {
             <button
               type="button"
               className="icon-button"
-              aria-label={showPassword ? 'Hide password' : 'Show password'}
+              aria-label={showPassword ? '隐藏密码' : '显示密码'}
               onClick={() => setShowPassword((value) => !value)}
             >
               {showPassword ? <EyeOff size={18} aria-hidden="true" /> : <Eye size={18} aria-hidden="true" />}
@@ -65,7 +66,7 @@ export function AuthPage({ mode = 'login', onLogin, onInit }) {
         </label>
         {error ? <div className="form-error" role="alert">{error}</div> : null}
         <button type="submit" className="primary-button" disabled={loading}>
-          {loading ? 'Signing in' : isInit ? 'Create admin' : 'Sign in'}
+          {loading ? (isInit ? '创建中' : '登录中') : isInit ? '创建管理员' : '登录'}
         </button>
       </form>
     </main>

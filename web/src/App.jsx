@@ -14,7 +14,7 @@ function PlaceholderPage({ title }) {
       <div className="section-header">
         <h1>{title}</h1>
       </div>
-      <div className="empty-state">No data loaded yet.</div>
+      <div className="empty-state">暂无数据</div>
     </section>
   );
 }
@@ -69,7 +69,7 @@ export function App() {
     setSession(null);
   }
 
-  if (checking) return <div className="loading-screen">Loading</div>;
+  if (checking) return <div className="loading-screen">加载中</div>;
   if (!session) return <AuthPage mode={authMode} onLogin={login} onInit={init} />;
 
   return (

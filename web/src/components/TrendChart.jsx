@@ -10,10 +10,10 @@ export function TrendChart({ rows = [] }) {
   return (
     <div className="chart-panel">
       <div className="chart-header">
-        <span>Token trend</span>
+        <span>Token 趋势</span>
         <strong className="tabular">{points.reduce((sum, point) => sum + point.y, 0).toLocaleString()}</strong>
       </div>
-      <svg viewBox="0 0 100 48" role="img" aria-label="Token trend">
+      <svg viewBox="0 0 100 48" role="img" aria-label="Token 趋势">
         <path d={path || 'M 0 42'} fill="none" stroke="currentColor" strokeWidth="2" vectorEffect="non-scaling-stroke" />
       </svg>
     </div>

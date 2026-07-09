@@ -35,10 +35,25 @@ describe('AuthPage', () => {
   it('submits login with visible labels and loading state', async () => {
     const login = vi.fn().mockResolvedValue({ ok: true });
     render(<AuthPage mode="login" onLogin={login} />);
-    await userEvent.type(screen.getByLabelText('Username'), 'admin');
-    await userEvent.type(screen.getByLabelText('Password'), 'pass123456');
-    await userEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+    await userEvent.type(screen.getByLabelText('用户名'), 'admin');
+    await userEvent.type(screen.getByLabelText('密码'), 'pass123456');
+    await userEvent.click(screen.getByRole('button', { name: '登录' }));
     expect(login).toHaveBeenCalledWith({ username: 'admin', password: 'pass123456' });
+  });
+
+  it('shows localized login errors from API codes', async () => {
+    const login = vi.fn().mockResolvedValue({
+      ok: false,
+      error: { code: 'invalid_credentials', message: 'Invalid username or password' },
+    });
+    render(<AuthPage mode="login" onLogin={login} />);
+
+    await userEvent.type(screen.getByLabelText('用户名'), 'admin');
+    await userEvent.type(screen.getByLabelText('密码'), 'pass123456');
+    await userEvent.click(screen.getByRole('button', { name: '登录' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('用户名或密码错误');
+    expect(screen.queryByText('Invalid username or password')).not.toBeInTheDocument();
   });
 });
 
@@ -52,13 +67,13 @@ describe('App auth flow', () => {
 
     render(<App />);
 
-    expect(await screen.findByRole('heading', { name: 'Initialize admin' })).toBeInTheDocument();
-    await userEvent.type(screen.getByLabelText('Username'), 'admin');
-    await userEvent.type(screen.getByLabelText('Password'), 'pass123456');
-    await userEvent.click(screen.getByRole('button', { name: 'Create admin' }));
+    expect(await screen.findByRole('heading', { name: '初始化管理员' })).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText('用户名'), 'admin');
+    await userEvent.type(screen.getByLabelText('密码'), 'pass123456');
+    await userEvent.click(screen.getByRole('button', { name: '创建管理员' }));
 
     expect(api.init).toHaveBeenCalledWith({ username: 'admin', password: 'pass123456' });
     expect(api.login).toHaveBeenCalledWith({ username: 'admin', password: 'pass123456' });
-    expect(await screen.findByRole('heading', { name: 'Dashboard' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: '仪表盘' })).toBeInTheDocument();
   });
 });

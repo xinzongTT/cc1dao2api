@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { KpiCard } from '../components/KpiCard.jsx';
 import { TrendChart } from '../components/TrendChart.jsx';
 import { DataTable } from '../components/DataTable.jsx';
+import { statusText } from '../components/StatusBadge.jsx';
 
 export function DashboardPage({ api }) {
   const [data, setData] = useState(null);
@@ -10,28 +11,28 @@ export function DashboardPage({ api }) {
     api.get('/admin/api/dashboard').then(({ payload }) => setData(payload));
   }, []);
 
-  if (!data) return <div className="empty-state">Loading dashboard</div>;
+  if (!data) return <div className="empty-state">加载仪表盘中</div>;
 
   return (
     <section className="page-section">
-      <div className="section-header"><h1>Dashboard</h1></div>
+      <div className="section-header"><h1>仪表盘</h1></div>
       <div className="kpi-grid">
-        <KpiCard label="Total requests" value={data.kpis.totalRequests.toLocaleString()} />
-        <KpiCard label="Today tokens" value={data.kpis.todayTokens.toLocaleString()} tone="success" />
-        <KpiCard label="Success rate" value={`${Math.round(data.kpis.successRate * 100)}%`} />
-        <KpiCard label="Available upstream keys" value={data.kpis.availableUpstreamKeys} />
-        <KpiCard label="Unknown quota keys" value={data.kpis.unknownQuotaKeys} tone="warning" />
-        <KpiCard label="Recent errors" value={data.kpis.recentErrors} tone="danger" />
+        <KpiCard label="总请求数" value={data.kpis.totalRequests.toLocaleString()} />
+        <KpiCard label="今日 Token" value={data.kpis.todayTokens.toLocaleString()} tone="success" />
+        <KpiCard label="成功率" value={`${Math.round(data.kpis.successRate * 100)}%`} />
+        <KpiCard label="可用上游密钥" value={data.kpis.availableUpstreamKeys} />
+        <KpiCard label="额度未知密钥" value={data.kpis.unknownQuotaKeys} tone="warning" />
+        <KpiCard label="最近错误" value={data.kpis.recentErrors} tone="danger" />
       </div>
       <TrendChart rows={data.tokenTrend} />
       <DataTable
         columns={[
-          { key: 'name', header: 'Upstream' },
-          { key: 'quotaStatus', header: 'Quota' },
-          { key: 'remainingTokens', header: 'Remaining', render: (row) => row.remainingTokens?.toLocaleString?.() || 'Unknown' },
+          { key: 'name', header: '上游' },
+          { key: 'quotaStatus', header: '额度', render: (row) => statusText(row.quotaStatus) },
+          { key: 'remainingTokens', header: '剩余 Token', render: (row) => row.remainingTokens?.toLocaleString?.() || '未知' },
         ]}
         rows={data.upstreamQuota || []}
-        emptyTitle="No upstream quota data"
+        emptyTitle="暂无上游额度数据"
       />
     </section>
   );
