@@ -38,6 +38,21 @@ describe('key management pages', () => {
     expect(await screen.findByText('成功')).toBeInTheDocument();
   });
 
+  it('localizes upstream error messages from persisted quota checks', async () => {
+    render(<UpstreamKeysPage api={fakeApi({
+      upstreamKeys: [{
+        id: 3,
+        name: 'main',
+        maskedKey: 'user_abcd...wxyz',
+        quotaStatus: 'failed',
+        lastErrorMessage: 'Quota endpoint returned 404',
+      }],
+    })} />);
+
+    expect(await screen.findByText('额度接口返回 404')).toBeInTheDocument();
+    expect(screen.queryByText('Quota endpoint returned 404')).not.toBeInTheDocument();
+  });
+
   it('creates an upstream key from the page form', async () => {
     const api = fakeApi();
     render(<UpstreamKeysPage api={api} />);

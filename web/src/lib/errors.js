@@ -16,3 +16,26 @@ const adminErrorMessages = {
 export function adminErrorMessage(error) {
   return adminErrorMessages[error?.code] || '请求失败';
 }
+
+const runtimeErrorPatterns = [
+  [/^Quota endpoint returned (\d+)$/, '额度接口返回 $1'],
+  [/^Upstream returned (\d+)$/, '上游返回 $1'],
+];
+
+const runtimeErrorMessages = {
+  'ENCRYPTION_KEY is missing or invalid': '加密密钥缺失或无效',
+  'Quota response was not recognized': '无法识别额度响应',
+  'Upstream authentication failed': '上游认证失败',
+  'Upstream key not found': '未找到上游密钥',
+  'Upstream returned zero output tokens': '上游返回的输出令牌为 0',
+  'fetch failed': '请求上游失败',
+};
+
+export function adminRuntimeErrorMessage(message) {
+  if (!message) return '无';
+  if (runtimeErrorMessages[message]) return runtimeErrorMessages[message];
+  for (const [pattern, replacement] of runtimeErrorPatterns) {
+    if (pattern.test(message)) return message.replace(pattern, replacement);
+  }
+  return /[A-Za-z]/.test(message) ? '请求失败' : message;
+}

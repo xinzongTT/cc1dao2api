@@ -3,7 +3,7 @@ import { Plus, Power, RefreshCcw, Trash2 } from 'lucide-react';
 import { ConfirmDialog } from '../components/ConfirmDialog.jsx';
 import { DataTable } from '../components/DataTable.jsx';
 import { StatusBadge, statusText } from '../components/StatusBadge.jsx';
-import { adminErrorMessage } from '../lib/errors.js';
+import { adminErrorMessage, adminRuntimeErrorMessage } from '../lib/errors.js';
 
 function quotaText(key) {
   if (key.quotaStatus === 'unknown') return '额度未知';
@@ -74,7 +74,7 @@ export function UpstreamKeysPage({ api }) {
     { key: 'quotaStatus', header: '额度', render: (row) => <span>{quotaText(row)}</span> },
     { key: 'lastQuotaCheckedAt', header: '最近刷新', render: (row) => row.lastQuotaCheckedAt || '从未' },
     { key: 'lastSuccessAt', header: '最近成功', render: (row) => row.lastSuccessAt || '从未' },
-    { key: 'lastErrorMessage', header: '最近错误', render: (row) => row.lastErrorMessage || '无' },
+    { key: 'lastErrorMessage', header: '最近错误', render: (row) => adminRuntimeErrorMessage(row.lastErrorMessage) },
     {
       key: 'actions',
       header: '操作',
