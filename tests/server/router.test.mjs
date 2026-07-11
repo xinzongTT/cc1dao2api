@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { loadConfig } from '../../server/config/index.mjs';
 import { createRouter } from '../../server/http/router.mjs';
 import { parseCookies, serializeCookie } from '../../server/http/cookies.mjs';
+import { startServer } from '../../server/index.mjs';
 
 describe('config', () => {
   it('uses /app/data/cc-proxy.sqlite by default', () => {
@@ -40,6 +41,26 @@ describe('router', () => {
     const res = { setHeader() {}, end(body) { calls.push(body); } };
     await router.handle(req, res);
     expect(calls).toEqual(['OK']);
+  });
+});
+
+describe('server lifecycle', () => {
+  it('starts and stops scheduler with the HTTP server', async () => {
+    const lifecycle = [];
+    const server = startServer({
+      databasePath: ':memory:',
+      host: '127.0.0.1',
+      port: 0,
+      createScheduler: () => ({
+        start() { lifecycle.push('start'); },
+        stop() { lifecycle.push('stop'); },
+      }),
+    });
+
+    await new Promise((resolve) => server.once('listening', resolve));
+    expect(lifecycle).toEqual(['start']);
+    await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    expect(lifecycle).toEqual(['start', 'stop']);
   });
 });
 

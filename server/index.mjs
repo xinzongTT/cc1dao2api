@@ -12,6 +12,7 @@ import { registerUsageRoutes } from './admin/routes/usage.mjs';
 import { registerDashboardRoutes } from './admin/routes/dashboard.mjs';
 import { registerSettingsRoutes } from './admin/routes/settings.mjs';
 import { createRelayProxyHandlers } from './proxy/relay.mjs';
+import { createScheduler } from './scheduler/index.mjs';
 
 export function createApp(overrides = {}) {
   const config = { ...loadConfig(), ...overrides };
@@ -45,11 +46,15 @@ export function createApp(overrides = {}) {
 }
 
 export function startServer(overrides = {}) {
-  const { config, router } = createApp(overrides);
+  const { config, router, ctx } = createApp(overrides);
+  const schedulerFactory = overrides.createScheduler || createScheduler;
+  const scheduler = schedulerFactory(ctx);
   const server = http.createServer((req, res) => router.handle(req, res));
   server.listen(config.port, config.host, () => {
+    scheduler.start();
     console.log(`[info] CC Proxy started http://${config.host}:${config.port}`);
   });
+  server.once('close', () => scheduler.stop());
   return server;
 }
 
