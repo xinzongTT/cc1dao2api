@@ -108,8 +108,9 @@ export function markUpstreamSuccess(db, id) {
   const timestamp = nowIso();
   db.prepare(`
     update upstream_keys
-    set health_status = case when health_status in ('invalid', 'limited', 'degraded') then health_status else 'healthy' end,
+    set health_status = 'healthy',
         last_success_at = @timestamp,
+        last_error_message = null,
         updated_at = @timestamp
     where id = @id
   `).run({ id, timestamp });

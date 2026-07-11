@@ -1,6 +1,6 @@
 import { buildCommandCodeHeaders } from '../commandCodeHeaders.mjs';
 import { getSetting } from '../db/repositories/settings.mjs';
-import { getUpstreamKey, setUpstreamQuota } from '../db/repositories/upstreamKeys.mjs';
+import { getUpstreamKey, markUpstreamSuccess, setUpstreamQuota } from '../db/repositories/upstreamKeys.mjs';
 import { decryptEnvelope } from '../security/encryption.mjs';
 
 function readNumber(...values) {
@@ -150,6 +150,7 @@ export async function refreshUpstreamQuota(ctx, upstreamKeyId) {
         quota.resetAt = billing.resetAt ?? quota.resetAt;
       }
       setUpstreamQuota(ctx.db, upstreamKeyId, { quotaStatus: 'success', ...quota, errorMessage: null });
+      markUpstreamSuccess(ctx.db, upstreamKeyId);
       return { ok: true, status: 'success', quota };
     } catch (error) {
       lastMessage = error.message;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { getUpstreamKey, setUpstreamQuota } from '../../server/db/repositories/upstreamKeys.mjs';
+import { getUpstreamKey, markUpstreamSuccess, setUpstreamHealth, setUpstreamQuota } from '../../server/db/repositories/upstreamKeys.mjs';
 import { expireOldReservations, reserveTokens } from '../../server/db/repositories/usage.mjs';
 import { refreshUpstreamQuota } from '../../server/quota/provider.mjs';
 import { createScheduler } from '../../server/scheduler/index.mjs';
@@ -34,6 +34,35 @@ describe('quota refresh and scheduler', () => {
     const row = getUpstreamKey(app.db, upstreamId);
     expect(row.quota_status).toBe('success');
     expect(row.quota_remaining_tokens).toBe(800);
+  });
+
+  it('restores upstream health after successful quota refresh', async () => {
+    const app = await createInitializedApp({
+      fetch: async () => jsonResponse(200, { total_tokens: 1000, used_tokens: 200, remaining_tokens: 800 }),
+    });
+    const upstreamId = await addEncryptedUpstreamKey(app, 'user_quota_recovers_health');
+    setUpstreamHealth(app.db, upstreamId, { healthStatus: 'degraded', errorMessage: 'Upstream returned 500' });
+
+    const result = await refreshUpstreamQuota(app.ctx, upstreamId);
+
+    expect(result.ok).toBe(true);
+    const row = getUpstreamKey(app.db, upstreamId);
+    expect(row.health_status).toBe('healthy');
+    expect(row.last_success_at).toBeTruthy();
+    expect(row.last_error_message).toBe(null);
+  });
+
+  it('marks upstream success as a healthy recovery signal', async () => {
+    const app = await createInitializedApp();
+    const upstreamId = await addEncryptedUpstreamKey(app, 'user_health_recovers');
+    setUpstreamHealth(app.db, upstreamId, { healthStatus: 'degraded', errorMessage: 'Upstream returned 500' });
+
+    markUpstreamSuccess(app.db, upstreamId);
+
+    const row = getUpstreamKey(app.db, upstreamId);
+    expect(row.health_status).toBe('healthy');
+    expect(row.last_success_at).toBeTruthy();
+    expect(row.last_error_message).toBe(null);
   });
 
   it('uses the CommandCode API-key usage summary endpoint for quota refresh', async () => {
